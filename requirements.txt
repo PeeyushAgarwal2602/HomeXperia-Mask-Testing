@@ -1,0 +1,15 @@
+transformers 
+torch 
+torchvision 
+opencv-python 
+Pillow 
+requests 
+matplotlib 
+segment-anything-hq 
+timm 
+flask 
+flask-cors 
+pyngrok 
+qrcode 
+fpdf2
+kornia

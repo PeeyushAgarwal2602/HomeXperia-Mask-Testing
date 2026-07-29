@@ -88,7 +88,7 @@ app = Flask(__name__)
 
 ALLOWED_ORIGINS = [
     "https://ai.homexperia.com",
-    "https://api.homexperia.com",
+    "https://precarnival-ernesto-unbiting.ngrok-free.dev",
     "https://dev.homexperia.com",
     "http://localhost:5173",
     "http://localhost:5174"
@@ -683,7 +683,7 @@ def process_room():
             filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
             cv2.imwrite(filepath, current_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-            final_image_url = f"https://api.homexperia.com/generated/{filename}"
+            final_image_url = f"https://precarnival-ernesto-unbiting.ngrok-free.dev/generated/{filename}"
 
             with _output_cache_lock:
                 # Snapshot the stack (detached from request dicts) so hits
@@ -741,7 +741,7 @@ def generate_and_segment_curtains():
         # Load the newly generated image into memory for OneFormer/SAM
         pil_image = Image.open(new_filepath).convert("RGB")
         new_room_id = str(uuid.uuid4()) # Generate a fresh ID for this new canvas state
-        server_base_url = "https://api.homexperia.com"
+        server_base_url = "https://precarnival-ernesto-unbiting.ngrok-free.dev"
 
         segmentation_result = process_scene_pipeline(
             image=pil_image,
@@ -864,7 +864,7 @@ def generate_masks_only():
             #     download_name=f"mask_{room_id}.png"
             # )
             
-            mask_url = f"https://api.homexperia.com/masks/mask_{room_id}_{hotspot_id}.png"
+            mask_url = f"https://precarnival-ernesto-unbiting.ngrok-free.dev/masks/mask_{room_id}_{hotspot_id}.png"
             return jsonify ({
                 "success": True,
                 "roomId": room_id,
@@ -1189,7 +1189,7 @@ def analyze_scene():
         img_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         image.save(img_path)
 
-        server_base_url = "https://api.homexperia.com"
+        server_base_url = "https://precarnival-ernesto-unbiting.ngrok-free.dev"
 
         print(f"{CYAN}➡ [INFO] Starting automatic scene analysis for Room: {room_id}{RESET}")
         result = process_scene_pipeline(
@@ -1228,7 +1228,7 @@ def catalogue_qr_generation():
     try:
         print(f"{CYAN}➡ [INFO] Generating {len(filter_value)} QRs for {customer_code}...{RESET}")
         
-        base_url = "https://api.homexperia.com"
+        base_url = "https://precarnival-ernesto-unbiting.ngrok-free.dev"
         
         generated_data = generate_catalogue_qr(
             customer_code=customer_code,
