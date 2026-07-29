@@ -2,8 +2,6 @@ import cv2
 import numpy as np
 import math
 
-from utils.mask_alpha import resize_mask_alpha
-
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_k % 2 == 0: blur_k += 1
@@ -46,10 +44,8 @@ def blend_hard_replace(original, texture, mask_gray, shadow_strength=0.6):
     lighting_map = get_lighting_map(original, blur_k=51)
     lighting_3ch = cv2.merge([lighting_map, lighting_map, lighting_map])
     shaded_texture = tex_f * (lighting_3ch ** shadow_strength)
-    # mask_gray arrives pre-feathered from resize_mask_alpha, with the ramp width
-    # scaled to the canvas. The (3, 3) blur that used to stand in for it here was
-    # a no-op at 4500px and left the boundary hard.
     mask_f = mask_gray.astype(np.float32) / 255.0
+    mask_f = cv2.GaussianBlur(mask_f, (3, 3), 0)
     mask_3ch = cv2.merge([mask_f, mask_f, mask_f])
     result = (orig_f * (1.0 - mask_3ch)) + (shaded_texture * mask_3ch)
     return np.clip(result * 255, 0, 255).astype(np.uint8)
@@ -81,7 +77,7 @@ def apply_pattern(room_img, wall_tex, mask_img, repeat=3):
     H, W = room_img.shape[:2]
     if len(mask_img.shape) == 3: mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
     else: mask_gray = mask_img
-    mask_gray = resize_mask_alpha(mask_gray, W, H)
+    mask_gray = cv2.resize(mask_gray, (W, H), interpolation=cv2.INTER_NEAREST)
     _, thresh = cv2.threshold(mask_gray, 127, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     

@@ -7,6 +7,8 @@ import torch
 import numpy as np
 from PIL import Image
 
+from utils.mask_geometry import regularize_mask
+
 # Global variables to hold the models in memory
 _models_loaded = False
 processor = None
@@ -80,11 +82,10 @@ SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
 # is never swallowed; vertical surfaces allow slightly larger fold/gap fills.
 DEFAULT_HOLE_FILL_FRAC = 0.003
 
-# How far past OneFormer's boundary refine_with_sam may grow a mask, as a
-# fraction of the long side (30px at 1536). It bounds how much unlabeled fringe a
-# mask can have GAINED, so strip_unlabeled_halo reuses it to bound how much it may
-# reclaim — the two must not drift apart.
-SAM_EXPANSION_FRAC = 0.02
+# Share of a labeled occluder that BiRefNet must claim before Step 1's decision to
+# fill OVER that object is trusted. Below this the fill is reverted and the object
+# is put back outside the mask — see revert_unconfirmed_occluders.
+OCCLUDER_CONFIRM_FRAC = 0.35
 
 HOLE_FILL_FRAC = {
     "floor": 0.0015,
@@ -575,84 +576,52 @@ def keep_significant_components(mask_img, image_area, frac_image=0.0005, min_abs
             out[labels == i] = 255
     return out
 
-def strip_unlabeled_halo(mask_uint8, segmentation_map, segment_id, other_of, protect=None,
-                         max_reach_frac=SAM_EXPANSION_FRAC):
-    """Give back the UNLABELED fringe that belongs to a neighbouring object.
+def revert_unconfirmed_occluders(mask_uint8, candidates, birefnet_fg,
+                                 confirm_frac=OCCLUDER_CONFIRM_FRAC, label=""):
+    """Fail CLOSED on the fill-then-cut gamble. Returns (mask, reverted_union).
 
-    EoMT rarely labels an object right up to its true boundary — it leaves a band
-    of void (-1) around every lamp, vase and pillow. Those pixels are invisible
-    to the `other_of` hard-subtract, which can only remove pixels that actually
-    carry another segment's id, while refine_with_sam may expand constrain_frac
-    (2% of the long side = 30px at 1536) past OneFormer's boundary and
-    `bitwise_or(refined, of_uint8)` then makes that expansion permanent. Verified
-    on room da5c6d5d: curtain#5's mask reached x=717 where its fabric actually
-    starts at x=748 — the void band around the table lamp standing in front of
-    it, which is how curtain texture ended up painted across that lamp and the
-    flowers beside it.
+    Step 1 of the wall and curtain paths deliberately fills OVER every segment in
+    BIREFNET_RECHECK_LABELS — lamp, vase, flower, sconce, plant — because EoMT
+    often bleeds an object's label onto the surface right beside it, and
+    filling-then-precisely-recutting recovers that fabric. The bet is that Step 2's
+    BiRefNet pass carves the object back out. When the bet loses, the object keeps
+    surface texture and nothing downstream can catch it: the _OCC_POST and wall
+    cleanup passes deliberately KEEP these labels, so the label-based safety net is
+    switched off for exactly the classes that stand in front of walls and curtains.
 
-    Ambiguous void is resolved by NEAREST LABEL rather than by eroding a fixed
-    width: a void pixel is dropped only when it sits closer to some other labeled
-    segment than to this surface's own labeled pixels. That keeps genuine wall
-    right next to a pillow (its nearest label is still the wall, so it stays and
-    gets papered) while releasing fringe that hugs an object, and it splits a
-    genuinely ambiguous gap down the middle instead of at an invented offset. A
-    fixed erosion width can't do either: the width that reclaims a 30px gap also
-    carves an un-textured trench around every object in the room.
+    Verified on room da5c6d5d: BiRefNet found lamp#29 cleanly but missed flower#24
+    entirely, so the flowers kept curtain texture. A colour/appearance veto cannot
+    rescue this — measured on that room's own saved photo crops, a/b chromaticity
+    spread across a whole crop is only 2-8 units because curtain, lamp, flowers and
+    wall are all neutral cream, and k-means on Lab separates shadow from highlight
+    rather than object from surface.
 
-    max_reach_frac caps how far out the rule may act, so a large void region far
-    from this surface's labeled core is never surrendered wholesale to a distant
-    object. Only void is ever touched — pixels EoMT labeled as this surface are
-    always kept, and labeled occluder pixels (lamp/vase/flower) are left to
-    BiRefNet.
+    So the discriminator has to be the label EoMT already produced and the pipeline
+    was throwing away. For every occluder component Step 1 filled over, measure how
+    much of it BiRefNet actually claimed; if it fell short, restore the exclusion.
+    Losing a little genuine fabric beside an object is the right trade against
+    painting over the object itself.
     """
-    void = (segmentation_map < 0)
-    if not void.any():
-        return mask_uint8
-    candidate = (mask_uint8 > 127) & void
-    if protect is not None:
-        candidate &= (protect == 0)
-    if not candidate.any():
-        return mask_uint8
-    own_labeled = (segmentation_map == segment_id)
-    if not own_labeled.any():
-        return mask_uint8
-
-    h, w = mask_uint8.shape[:2]
-    # distanceTransform measures to the nearest ZERO, so each source is inverted.
-    d_self = cv2.distanceTransform((~own_labeled).astype(np.uint8) * 255, cv2.DIST_L2, 3)
-    d_other = cv2.distanceTransform(cv2.bitwise_not(other_of), cv2.DIST_L2, 3)
-    max_reach = max(3.0, max_reach_frac * max(h, w))
-
-    strip = candidate & (d_other < d_self) & (d_other <= max_reach)
-    if not strip.any():
-        return mask_uint8
-    out = mask_uint8.copy()
-    out[strip] = 0
-    return out
-
-def prune_speckles(mask_uint8, image_area, frac_image=0.0001, min_abs=64, protect=None):
-    """Final speckle filter, run after every edge pass and subtraction.
-
-    postprocess_mask already calls keep_significant_components, but that happens
-    BEFORE the bbox hole fills, before the _dropped_wall restore (which
-    deliberately re-adds sub-threshold components) and before two more
-    guided-filter passes — each of which can (re)introduce islands. So
-    sub-threshold blobs routinely survive into the saved mask: one measured wall
-    mask kept components of 395/87/46/13px against its own 786px threshold, and
-    at the ~3x render upscale even the 46px one paints a ~20x20px blob, which is
-    the speckle visible beside the door.
-
-    Threshold is deliberately 5x looser than keep_significant_components' own
-    500ppm so this cannot silently undo the _dropped_wall restore. Measured over
-    400 wall masks the distribution is cleanly bimodal — median non-largest
-    component ~2ppm of the image, legitimate second regions (a soffit above a
-    window, a wall face past a curtain) above ~1000ppm — so 100ppm removes 91%
-    of islands while touching nothing real.
-    """
-    pruned = keep_significant_components(mask_uint8, image_area, frac_image=frac_image, min_abs=min_abs)
-    if protect is not None and protect.any():
-        pruned = cv2.bitwise_or(pruned, cv2.bitwise_and(mask_uint8, protect))
-    return pruned
+    reverted = np.zeros_like(mask_uint8)
+    if not candidates:
+        return mask_uint8, reverted
+    n = 0
+    for cand in candidates:
+        raw = cand[4]
+        known = int(np.count_nonzero(raw))
+        if known <= 0:
+            continue
+        claimed = 0
+        if birefnet_fg is not None:
+            claimed = int(np.count_nonzero(cv2.bitwise_and(raw, birefnet_fg)))
+        if claimed / float(known) < confirm_frac:
+            reverted = cv2.bitwise_or(reverted, raw)
+            n += 1
+    if n:
+        mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(reverted))
+        print(f"[FAIL-CLOSED] {label}: reverted {n}/{len(candidates)} occluder "
+              f"fill(s) BiRefNet did not confirm")
+    return mask_uint8, reverted
 
 def _guided_filter(I, p, radius, eps):
     ksize = (2 * radius + 1, 2 * radius + 1)
@@ -739,8 +708,7 @@ def _best_iou_index(masks, of_bool):
             best_iou, best_idx = iou, i
     return best_idx
 
-def refine_with_sam(predictor, of_bool, bbox, neg_points, image_shape, shrink_guard=0.7,
-                    constrain_frac=SAM_EXPANSION_FRAC):
+def refine_with_sam(predictor, of_bool, bbox, neg_points, image_shape, shrink_guard=0.7, constrain_frac=0.02):
     """SAM boundary refinement seeded by OneFormer (mask_input + multi-point +
     box prompt). The SAM result is constrained to a dilated OneFormer region so
     it cannot bleed into neighbours, and falls back to OneFormer if SAM collapses
@@ -1043,15 +1011,15 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             # SAM refine can expand ~38px beyond the OF boundary; this prevents it
             # bleeding into lamps, mirrors, bed, paintings that OF correctly identified.
             #
-            # VOID is -1, not 0. EoMT ships its own compute_segments (distinct from
-            # Mask2Former's, which does start ids at 1): transformers 4.56 fills the
-            # map via `torch.zeros(...) - 1` and assigns `current_segment_id` BEFORE
-            # incrementing it, so ids start at 0 and 0 is an ordinary segment — in
-            # this room set it is usually whichever surface scored first, typically
-            # the floor (verified: `floor#0` in the eomt_labels debug overlays).
-            # `!= 0` therefore treated that one real segment as void and never
-            # subtracted it from any other surface's mask, and when segment 0 was
-            # itself the hotspot it wrongly counted void as "another object".
+            # VOID is -1, not 0. EoMT ships its own compute_segments (unlike
+            # Mask2Former's, which does start ids at 1): transformers 4.56 builds the
+            # map with `torch.zeros(...) - 1` and assigns `current_segment_id` BEFORE
+            # incrementing, so ids start at 0 and 0 is an ordinary segment — usually
+            # whichever surface scored first, typically the floor (verified: `floor#0`
+            # in the eomt_labels debug overlays). `!= 0` therefore treated that one
+            # real segment as void and never subtracted it from any other surface's
+            # mask, and when segment 0 was itself the hotspot it counted void as
+            # "another object".
             other_of = ((segmentation_map >= 0) & (segmentation_map != segment_id)).astype(np.uint8) * 255
             mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(other_of))
 
@@ -1061,6 +1029,12 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             # detection as the curtain path below, so an object handled once
             # (for a curtain, say) gets reused here at identical quality instead
             # of a second, independently-run — and possibly worse — detection.
+            # Union of occluders whose fill BiRefNet failed to confirm. Re-applied
+            # once more at the very end, because the guided-filter pass and the
+            # _OCC_POST / wall cleanup loops below both leave recheck labels alone
+            # and can grow the surface straight back over them.
+            reverted_occluders = np.zeros((height, width), np.uint8)
+
             fg_combined = None
             if seg_class == "wall":
                 try:
@@ -1267,6 +1241,14 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                         # Hole-reveal and the re-cut against the later guided-
                         # filter edge pass both happen once, shared with the
                         # curtain path, further down — see _birefnet_occluder_mask.
+                    # Fail closed on any wall_candidate BiRefNet did not actually
+                    # carve out. Runs OUTSIDE the fg_combined.any() guard above,
+                    # because the worst case is precisely fg_combined coming back
+                    # empty — then the guarded block never executes and every
+                    # filled object stays painted.
+                    mask_uint8, _rev_occ = revert_unconfirmed_occluders(
+                        mask_uint8, wall_candidates, fg_combined, label="wall")
+                    reverted_occluders = cv2.bitwise_or(reverted_occluders, _rev_occ)
                 except Exception as _we:
                     print(f"⚠ [WARN] BiRefNet wall step failed ({_we}); skipping.")
 
@@ -1461,6 +1443,11 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                         mask_uint8 = cv2.bitwise_and(
                             mask_uint8, cv2.bitwise_not(fg_full)
                         )
+                        # Fail closed on any occluder BiRefNet did not carve out —
+                        # this is what stops flower#24 keeping curtain texture.
+                        mask_uint8, _rev_occ = revert_unconfirmed_occluders(
+                            mask_uint8, fg_object_bboxes, fg_full, label="curtain")
+                        reverted_occluders = cv2.bitwise_or(reverted_occluders, _rev_occ)
                 except Exception as _be:
                     print(f"⚠ [WARN] BiRefNet curtain refinement failed ({_be}); skipping.")
 
@@ -1476,11 +1463,9 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             # smooths them onto real colour transitions in the photo.
             mask_uint8 = refine_mask_edges(mask_uint8, image_cv)
             # A revealed occluder hole is by construction a small island fully
-            # enclosed by the occluder — exactly the shape the hygiene passes at
-            # the end of this block would otherwise throw away (the halo strip
-            # because the hole sits inside another object's dilated ring, the
-            # speckle prune because it is disconnected and tiny). Track every
-            # reveal so both passes can exempt it.
+            # enclosed by the occluder — exactly the shape the speckle prune at the
+            # end of this block would otherwise discard. Track every reveal so it
+            # can be exempted.
             revealed_holes = np.zeros((height, width), np.uint8)
             _birefnet_occluder_mask = fg_full if seg_class == "curtain" else fg_combined
             if _birefnet_occluder_mask is not None:
@@ -1554,12 +1539,33 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 mask_uint8 = cv2.bitwise_or(mask_uint8, _rev_again)
                 revealed_holes = cv2.bitwise_or(revealed_holes, _rev_again)
 
-            # --- Hygiene: runs after EVERY edge pass and subtraction above, so
-            # nothing downstream can reintroduce what these two remove. ---
-            mask_uint8 = strip_unlabeled_halo(
-                mask_uint8, segmentation_map, segment_id, other_of, protect=revealed_holes
-            )
-            mask_uint8 = prune_speckles(mask_uint8, image_area, protect=revealed_holes)
+            # Re-apply the fail-closed reverts: the guided filter above follows
+            # colour contrast only, and both cleanup loops deliberately leave
+            # recheck labels alone, so either can grow the surface back over an
+            # object whose fill was already rejected.
+            if reverted_occluders.any():
+                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(reverted_occluders))
+
+            # Impose straightness on architectural boundaries and take the
+            # staircase off object silhouettes. This is the fix for the "wavy /
+            # torn edges" defect: the masks are already locally smooth (0.63px
+            # wobble at 12px scale), but 84% of the median wall perimeter is long
+            # runs that are near-straight without being straight — see
+            # utils/mask_geometry for the measurements.
+            mask_uint8 = regularize_mask(mask_uint8)
+
+            # Final speckle filter. postprocess_mask's keep_significant_components
+            # runs before the hole fills, the _dropped_wall restore and two
+            # guided-filter passes, so sub-threshold islands routinely survive into
+            # the saved mask (one measured wall mask kept 395/87/46/13px components
+            # against its own 786px threshold). Threshold here is deliberately 5x
+            # looser than that pass so it cannot undo the _dropped_wall restore.
+            _pre_prune = mask_uint8.copy()
+            mask_uint8 = keep_significant_components(mask_uint8, image_area,
+                                                    frac_image=0.0001, min_abs=64)
+            if revealed_holes.any():
+                mask_uint8 = cv2.bitwise_or(
+                    mask_uint8, cv2.bitwise_and(_pre_prune, revealed_holes))
         except Exception as e:
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8

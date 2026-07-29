@@ -2,8 +2,6 @@ import cv2
 import numpy as np
 import math
 
-from utils.mask_alpha import resize_mask_alpha
-
 # Auto-repeat scale anchor: tile width ~ canvas_width / 12 (the old production
 # tile size at the frontend's default repeat), as an integer count per wall.
 TARGET_TILES_ACROSS_CANVAS = 12.0
@@ -69,10 +67,8 @@ def blend_hard_replace(original, texture, mask_gray, shadow_strength=0.6):
 
     lighting_3ch = cv2.merge([lighting_map, lighting_map, lighting_map])
     shaded_texture = tex_f * (lighting_3ch ** shadow_strength)
-    # mask_gray arrives pre-feathered from resize_mask_alpha, with the ramp width
-    # scaled to the canvas. The (3, 3) blur that used to stand in for it here was
-    # a no-op at 4500px and left the boundary hard.
     mask_f = mask_gray.astype(np.float32) / 255.0
+    mask_f = cv2.GaussianBlur(mask_f, (3, 3), 0)
     mask_3ch = cv2.merge([mask_f, mask_f, mask_f])
     result = (orig_f * (1.0 - mask_3ch)) + (shaded_texture * mask_3ch)
     return np.clip(result * 255, 0, 255).astype(np.uint8)
@@ -661,10 +657,7 @@ def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=
     print("[INFO] Processing Wall (Structural Perspective + Corner Split)...")
     H, W = room_img.shape[:2]
     mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY) if len(mask_img.shape) == 3 else mask_img
-    mask_gray = resize_mask_alpha(mask_gray, W, H)
-    # Plane detection, quad fitting and warp coverage all still work off a binary
-    # mask; thresholding the soft alpha at 127 recovers it, now with a sub-pixel
-    # accurate boundary instead of one quantised to the upload's pixel grid.
+    mask_gray = cv2.resize(mask_gray, (W, H), interpolation=cv2.INTER_NEAREST)
     _, thresh = cv2.threshold(mask_gray, 127, 255, cv2.THRESH_BINARY)
 
     planes = _detect_wall_planes(thresh, debug_img=room_img, depth_map=depth_map, focal_px=WALL_FOCAL_RATIO * max(H, W))
@@ -737,11 +730,8 @@ def apply_pattern(room_img, wall_tex, mask_img, fallback_repeat=None, depth_map=
             dest[covered] = plane_slice[covered]
 
         # Safety net: any masked pixel every warp missed gets filled from the
-        # nearest textured pixel — a void inside the wall is never acceptable.
-        # Driven by the SOFT alpha, not `thresh`: the feather band sits outside
-        # the binary mask but still receives texture in the blend, so leaving it
-        # black there would darken the original photo along every edge.
-        warped_total = _fill_uncovered(warped_total, mask_gray)
+        # nearest textured pixel — a void inside the wall is never acceptable
+        warped_total = _fill_uncovered(warped_total, thresh)
         result = blend_hard_replace(room_img, warped_total, mask_gray, shadow_strength=shadow_strength)
         return result, (int(repeat_total) if is_auto else None)
     except Exception as e:

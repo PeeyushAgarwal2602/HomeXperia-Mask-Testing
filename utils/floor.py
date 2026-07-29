@@ -2,8 +2,6 @@ import cv2
 import numpy as np
 import math
 
-from utils.mask_alpha import resize_mask_alpha
-
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_k % 2 == 0: blur_k += 1
@@ -18,10 +16,8 @@ def blend_hard_replace(original, texture, mask_gray, shadow_strength=0.15):
     lighting_3ch = cv2.merge([lighting_map, lighting_map, lighting_map])
 
     shaded_texture = tex_f * (lighting_3ch ** shadow_strength)
-    # mask_gray arrives pre-feathered from resize_mask_alpha, with the ramp width
-    # scaled to the canvas. The (3, 3) blur that used to stand in for it here was
-    # a no-op at 4500px and left the boundary hard.
     mask_f = mask_gray.astype(np.float32) / 255.0
+    mask_f = cv2.GaussianBlur(mask_f, (3, 3), 0)
     mask_3ch = cv2.merge([mask_f, mask_f, mask_f])
     
     result = (orig_f * (1.0 - mask_3ch)) + (shaded_texture * mask_3ch)
@@ -271,7 +267,7 @@ def apply_pattern(room_img, floor_tex, mask_img, repeat=3, rotation_deg=0, grout
     if len(mask_img.shape) == 3: mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
     else: mask_gray = mask_img
     
-    mask_gray = resize_mask_alpha(mask_gray, W, H)
+    mask_gray = cv2.resize(mask_gray, (W, H), interpolation=cv2.INTER_NEAREST)
 
     try:
         quad, _ = _detect_floor_quad(room_img)
@@ -364,15 +360,6 @@ def apply_pattern(room_img, floor_tex, mask_img, repeat=3, rotation_deg=0, grout
         valid_x = X_screen.ravel()[valid]
         
         warped_tex[valid_y, valid_x] = single_tile[V, U]
-
-        # Only pixels the inverse map actually wrote carry texture; anything the
-        # STRICT horizon filter (Z <= 0.0001) rejected is still black. Clamp the
-        # alpha to what was written instead of letting the blend mix in black and
-        # darken the photo there. Built from the written coordinates rather than
-        # from pixel darkness so a legitimately black tile isn't clipped away.
-        covered = np.zeros((H, W), np.uint8)
-        covered[valid_y, valid_x] = 255
-        mask_gray = cv2.bitwise_and(mask_gray, covered)
 
         return blend_hard_replace(room_img, warped_tex, mask_gray, shadow_strength=0.15)
         
