@@ -73,6 +73,24 @@ ONEFORMER_EXTENT_CLASSES = {"wall", "floor", "curtain"}
 # Surfaces from which precise occluder silhouettes should be subtracted.
 OCCLUDER_SUBTRACT_CLASSES = {"curtain", "wall"}
 
+# Neighbours whose shared boundary with a surface is a genuine straight
+# architectural edge, and may therefore be straightened by mask_geometry. Anything
+# absent from this set — furniture, lamps, plants, mirrors, wall art, and CURTAIN
+# FABRIC — bounds the surface with an organic contour that must survive verbatim.
+# Verified why this has to be semantic rather than geometric: a torn soffit edge
+# (sagitta/length 0.069, one-sided 1.00) and an oval mirror's arc (0.066, 1.00) are
+# numerically identical, so no curvature threshold can separate them.
+STRAIGHTEN_AGAINST_LABELS = {
+    "wall", "ceiling", "floor", "flooring", "window", "windowpane",
+    "door", "doorframe", "skirting", "baseboard", "column", "beam", "pillar",
+}
+
+# Surfaces whose own outline is architectural enough to straighten at all. A
+# curtain is fabric — its edges are folds and hems, and the same physical boundary
+# a wall must preserve against a curtain would be "against a wall" from the
+# curtain's side — so curtains get detail smoothing only, never straightening.
+STRAIGHTEN_SURFACE_CLASSES = {"wall", "floor", "rug", "window", "door"}
+
 OCCLUDER_MIN_AREA = 0.0005     # ignore occluder segments below 0.05% of the image
 SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
 
@@ -1539,6 +1557,35 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 mask_uint8 = cv2.bitwise_or(mask_uint8, _rev_again)
                 revealed_holes = cv2.bitwise_or(revealed_holes, _rev_again)
 
+            # Generalise the fail-closed rule to EVERY recheck-labeled segment the
+            # mask overlaps, not just those that became BiRefNet candidates.
+            # find_occluder_candidates needs a >=100px overlap with the surface's
+            # dilated region, so an object the surface only partly bleeds onto is
+            # never a candidate and never gets reverted — and the cleanup loops
+            # above deliberately keep these labels. Measured on room d56138d4 with
+            # the per-candidate revert already in place: the wall still covered 63%
+            # of the pelmet box and 41% of the lamp/flowers box.
+            if seg_class in ("wall", "curtain"):
+                _bn = fg_full if seg_class == "curtain" else fg_combined
+                for _seg in segments_info:
+                    if _seg["id"] == segment_id:
+                        continue
+                    _lbl = get_label_from_id(id2label, _seg["label_id"])
+                    if not label_matches(_lbl, BIREFNET_RECHECK_LABELS):
+                        continue
+                    _sm = (segmentation_map == _seg["id"])
+                    _known = int(np.count_nonzero(_sm))
+                    if _known <= 0 or not np.logical_and(_sm, mask_uint8 > 127).any():
+                        continue
+                    _claimed = (int(np.count_nonzero(np.logical_and(_sm, _bn > 127)))
+                                if _bn is not None else 0)
+                    if _claimed / float(_known) < OCCLUDER_CONFIRM_FRAC:
+                        reverted_occluders[_sm] = 255
+            # A revealed see-through gap must never be undone by the sweep above.
+            if revealed_holes.any():
+                reverted_occluders = cv2.bitwise_and(
+                    reverted_occluders, cv2.bitwise_not(revealed_holes))
+
             # Re-apply the fail-closed reverts: the guided filter above follows
             # colour contrast only, and both cleanup loops deliberately leave
             # recheck labels alone, so either can grow the surface back over an
@@ -1546,13 +1593,36 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             if reverted_occluders.any():
                 mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(reverted_occluders))
 
-            # Impose straightness on architectural boundaries and take the
-            # staircase off object silhouettes. This is the fix for the "wavy /
-            # torn edges" defect: the masks are already locally smooth (0.63px
-            # wobble at 12px scale), but 84% of the median wall perimeter is long
-            # runs that are near-straight without being straight — see
-            # utils/mask_geometry for the measurements.
-            mask_uint8 = regularize_mask(mask_uint8)
+            # Impose straightness on ARCHITECTURAL boundaries only, and take the
+            # staircase off object silhouettes. The masks are already locally
+            # smooth (0.63px wobble at a 12px scale) but 84% of the median wall
+            # perimeter is long runs that are near-straight without being straight
+            # — see utils/mask_geometry.
+            #
+            # Straightening must be gated on WHAT LIES ACROSS the boundary, because
+            # a gently curved arc has excellent chord support: without this gate a
+            # decorative tree collapsed into a diamond and an oval mirror's top
+            # arc flattened. Anything not in STRAIGHTEN_AGAINST_LABELS blocks
+            # straightening in its neighbourhood, as do the BiRefNet cutouts and
+            # occluder silhouettes (they mark objects EoMT left unlabeled).
+            _straighten_zone = np.zeros((height, width), np.uint8)
+            if seg_class in STRAIGHTEN_SURFACE_CLASSES:
+                _blockers = np.zeros((height, width), np.uint8)
+                for _seg in segments_info:
+                    if _seg["id"] == segment_id:
+                        continue
+                    _lbl = get_label_from_id(id2label, _seg["label_id"])
+                    if not label_matches(_lbl, STRAIGHTEN_AGAINST_LABELS):
+                        _blockers[segmentation_map == _seg["id"]] = 255
+                for _extra in (fg_combined, fg_full, occluder_union,
+                               occluder_dilated, reverted_occluders):
+                    if _extra is not None:
+                        _blockers = cv2.bitwise_or(_blockers, _extra)
+                _zk = max(3, int(0.006 * max(width, height)))
+                _straighten_zone = cv2.bitwise_not(
+                    cv2.dilate(_blockers, np.ones((_zk, _zk), np.uint8)))
+            # A curtain gets an all-zero zone: detail smoothing, no straightening.
+            mask_uint8 = regularize_mask(mask_uint8, straighten_zone=_straighten_zone)
 
             # Final speckle filter. postprocess_mask's keep_significant_components
             # runs before the hole fills, the _dropped_wall restore and two

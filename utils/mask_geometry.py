@@ -48,7 +48,34 @@ fails and it falls through to the fine pass, whereas a torn straight edge depart
 only at localised bites and passes. Without the gate, a coarse tolerance would
 happily cut the corner off two adjoining walls.
 
-Edges are then classified by LENGTH at whichever scale claimed them:
+WHY LENGTH ALONE IS NOT ENOUGH — the straighten_zone
+-----------------------------------------------------
+A gently curved arc has excellent chord support: every 61px chunk of an oval sits
+within a few px of its chord, so a length-plus-support rule straightens each chunk
+and turns the oval into a polygon. Measured on real masks: a decorative tree
+silhouette collapsed into a diamond and an oval mirror's top arc flattened.
+
+Geometry cannot fix this, and it is worth being precise about why. The obvious
+tests were measured on real runs, and the case that MUST be straightened is
+numerically indistinguishable from the case that must be preserved:
+
+    soffit torn edge (straighten)   sagitta/length 0.069   one-sidedness 1.00
+    oval mirror arc  (preserve)     sagitta/length 0.066   one-sidedness 1.00
+
+A torn architectural edge and a curved object silhouette are the same shape class.
+No curvature, sagitta, sign-change or residual-distribution threshold separates
+them, so this module does not pretend to.
+
+What separates them is SEMANTIC: what lies on the other side of the boundary. A
+wall meeting a ceiling, floor, window frame or another wall shares a genuinely
+straight architectural edge. A wall meeting a mirror, a plant, a lamp or curtain
+fabric is bounded by that object's organic contour. The caller knows which is
+which — it has the panoptic labels — so it passes a `straighten_zone` marking
+where straightening is permitted. Outside that zone edges are restored verbatim
+however straight they look.
+
+Edges inside the zone are then classified by LENGTH at whichever scale claimed
+them:
 
   long edge  (>= min_len)  -> emit the straight segment: ceiling lines, skirting,
                               window-frame verticals, soffit edges, corner patches.
@@ -76,6 +103,11 @@ TAU_COARSE_FRAC = 0.015
 # Share of an arc that must lie within tau_fine of a coarse chord before that
 # chord is accepted as the underlying straight structure.
 COARSE_ACCEPT_FRAC = 0.60
+
+# Share of an arc that must fall inside straighten_zone before the arc may be
+# straightened. Deliberately high: an arc straddling the edge of the zone is
+# partly against an object, and half-straightening it produces a corner.
+ZONE_ACCEPT_FRAC = 0.90
 
 # Minimum edge length to treat as architecture, as a fraction of the long side
 # (61px at 1536). Below this an edge is assumed object detail and is restored.
@@ -161,7 +193,17 @@ def _arc_supports_chord(arc, p0, p1, tau_fine, frac_needed=COARSE_ACCEPT_FRAC):
     return float((resid <= tau_fine).mean()) >= frac_needed
 
 
-def _refine_arc(arc, tau_fine, min_len, detail_sigma):
+def _arc_in_zone(arc, zone, frac_needed=ZONE_ACCEPT_FRAC):
+    """Does the arc lie inside the region where straightening is permitted?"""
+    if zone is None:
+        return True
+    h, w = zone.shape[:2]
+    xs = np.clip(np.round(arc[:, 0]).astype(np.int32), 0, w - 1)
+    ys = np.clip(np.round(arc[:, 1]).astype(np.int32), 0, h - 1)
+    return float((zone[ys, xs] > 0).mean()) >= frac_needed
+
+
+def _refine_arc(arc, tau_fine, min_len, detail_sigma, zone=None):
     """Fine pass over one arc the coarse pass did not claim. Emits the arc's
     points from its start up to (not including) its last point — the caller's
     next edge contributes that."""
@@ -177,16 +219,18 @@ def _refine_arc(arc, tau_fine, min_len, detail_sigma):
 
     out = []
     for a in range(len(poly) - 1):
-        if float(np.hypot(*(poly[a + 1] - poly[a]))) >= min_len:
+        sub = arc[idx[a]:idx[a + 1]]
+        if (float(np.hypot(*(poly[a + 1] - poly[a]))) >= min_len
+                and (len(sub) == 0 or _arc_in_zone(sub, zone))):
             out.append(poly[a].reshape(1, 2).astype(np.float64))
         else:
-            sub = arc[idx[a]:idx[a + 1]]
             out.append(_smooth_open(sub, detail_sigma) if len(sub)
                        else poly[a].reshape(1, 2).astype(np.float64))
     return np.vstack(out) if out else _smooth_open(arc[:-1], detail_sigma)
 
 
-def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0):
+def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0,
+                       zone=None):
     """Straighten a contour's architectural runs, preserve its detail runs."""
     pts = contour.squeeze()
     if pts.ndim != 2 or len(pts) < 8:
@@ -204,7 +248,8 @@ def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0)
         b = (a + 1) % k
         arc = _arc(pts, idx[a], idx[b])
         long_enough = float(np.hypot(*(poly[b] - poly[a]))) >= min_len
-        if long_enough and _arc_supports_chord(arc, poly[a], poly[b], tau_fine):
+        if (long_enough and _arc_in_zone(arc, zone)
+                and _arc_supports_chord(arc, poly[a], poly[b], tau_fine)):
             # Architecture: emit only the start vertex so the fill walks a dead
             # straight line from here to the next vertex.
             out.append(poly[a].reshape(1, 2).astype(np.float64))
@@ -212,19 +257,19 @@ def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0)
             out.append(poly[a].reshape(1, 2).astype(np.float64))
         else:
             out.append(_refine_arc(np.vstack([arc, pts[idx[b]]]),
-                                   tau_fine, min_len, detail_sigma))
+                                   tau_fine, min_len, detail_sigma, zone=zone))
     return np.vstack(out)
 
 
 def _regularize_bounded(contour, tau_fine, tau_coarse, min_len, detail_sigma,
-                        max_area_delta=MAX_AREA_DELTA):
+                        zone=None, max_area_delta=MAX_AREA_DELTA):
     """Regularise one contour, backing off the tolerances until the area it costs
     is acceptable. Returns None if even the smallest scale overshoots, so the
     caller keeps the original boundary rather than damaging the shape."""
     a0 = abs(cv2.contourArea(contour))
     for scale in RETRY_SCALES:
         reg = regularize_contour(contour, tau_fine * scale, tau_coarse * scale,
-                                 min_len, detail_sigma * scale)
+                                 min_len, detail_sigma * scale, zone=zone)
         if reg is None or len(reg) < 3:
             continue
         if a0 <= 0:
@@ -235,10 +280,18 @@ def _regularize_bounded(contour, tau_fine, tau_coarse, min_len, detail_sigma,
     return None
 
 
-def regularize_mask(mask_img, tau_fine_frac=TAU_FINE_FRAC,
+def regularize_mask(mask_img, straighten_zone=None, tau_fine_frac=TAU_FINE_FRAC,
                     tau_coarse_frac=TAU_COARSE_FRAC, min_len_frac=MIN_LEN_FRAC,
                     detail_sigma_frac=DETAIL_SIGMA_FRAC):
-    """Regularise every boundary of a binary mask. Returns a uint8 0/255 mask."""
+    """Regularise every boundary of a binary mask. Returns a uint8 0/255 mask.
+
+    straighten_zone: uint8 mask, non-zero where straightening is permitted. Build
+    it from the panoptic labels — permit boundary against architectural planes
+    (ceiling, floor, another wall, a window or door frame) and forbid it against
+    objects and curtain fabric. Passing None permits everywhere, which will
+    polygonise curved silhouettes; callers with label information should always
+    supply it.
+    """
     if mask_img is None:
         return mask_img
     binary = (mask_img > 127).astype(np.uint8)
@@ -269,7 +322,8 @@ def regularize_mask(mask_img, tau_fine_frac=TAU_FINE_FRAC,
     # depth fills, odd depth carves. Handles a component sitting inside a hole,
     # which a flat outer-then-holes pass would erase.
     for i in sorted(range(len(cnts)), key=depth):
-        reg = _regularize_bounded(cnts[i], tau_fine, tau_coarse, min_len, detail_sigma)
+        reg = _regularize_bounded(cnts[i], tau_fine, tau_coarse, min_len,
+                                  detail_sigma, zone=straighten_zone)
         if reg is None or len(reg) < 3:
             reg = cnts[i].squeeze()
             if reg.ndim != 2 or len(reg) < 3:
