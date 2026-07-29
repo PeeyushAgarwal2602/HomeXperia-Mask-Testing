@@ -114,9 +114,17 @@ ZONE_ACCEPT_FRAC = 0.90
 MIN_LEN_FRAC = 0.04
 
 # Arc-length sigma for smoothing short/detail runs, as a fraction of the long side
-# (3.8px at 1536). Takes the staircase and BiRefNet's fringe off object
-# silhouettes; set to 0 to leave detail bit-exact.
+# (3.8px at 1536). This is a CEILING, not a fixed amount — see _local_scale_map.
+# Set to 0 to leave detail bit-exact.
 DETAIL_SIGMA_FRAC = 0.0025
+
+# Fraction of the LOCAL feature half-width that smoothing may use. A mask holds
+# structure spanning three orders of magnitude — a 2px gap between twigs and a
+# 2500px wall span — so a single global sigma cannot be right for both. Measured
+# on room 668b83dc: a 3.84px sigma applied to 4.6px-wide twigs merged them and
+# dropped the cutout's perimeter/area from 0.197 to 0.182, and the surviving wall
+# slivers between branches are what makes wallpaper visible between twigs.
+SMOOTH_WIDTH_FRAC = 0.5
 
 # Largest area change a single contour may suffer before its tolerances are
 # retried smaller. The tolerances above are scaled to the IMAGE, but the damage
@@ -158,6 +166,36 @@ def _vertex_indices(pts, poly, start=0, wrap=True):
         idx.append(hit)
         start = hit
     return idx
+
+
+def _local_scale_map(binary, reach):
+    """Local feature half-width at every pixel, in pixels.
+
+    Takes the MINIMUM of "how thick is the mask here" and "how thick is the gap
+    here", so a boundary is treated as fine whenever EITHER side of it is fine.
+    Using the maximum (or the mask alone) would let a twig sitting against a big
+    wall inherit the wall's width and get smoothed away — which is exactly the
+    regression this map exists to prevent.
+
+    Each distance transform is dilated by `reach` so boundary pixels, where both
+    transforms are ~0, inherit the width of the structure they belong to.
+    """
+    dt_in = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    dt_out = cv2.distanceTransform(cv2.bitwise_not(binary), cv2.DIST_L2, 3)
+    k = max(3, int(reach) | 1)
+    ker = np.ones((k, k), np.uint8)
+    return np.minimum(cv2.dilate(dt_in, ker), cv2.dilate(dt_out, ker))
+
+
+def _arc_sigma(arc, sigma_cap, scale_map):
+    """Smoothing sigma for one arc: the global cap, limited by local structure."""
+    if sigma_cap <= 0 or scale_map is None or len(arc) == 0:
+        return sigma_cap
+    h, w = scale_map.shape[:2]
+    xs = np.clip(np.round(arc[:, 0]).astype(np.int32), 0, w - 1)
+    ys = np.clip(np.round(arc[:, 1]).astype(np.int32), 0, h - 1)
+    local = float(np.median(scale_map[ys, xs]))
+    return min(sigma_cap, SMOOTH_WIDTH_FRAC * local)
 
 
 def _smooth_open(pts, sigma):
@@ -203,7 +241,7 @@ def _arc_in_zone(arc, zone, frac_needed=ZONE_ACCEPT_FRAC):
     return float((zone[ys, xs] > 0).mean()) >= frac_needed
 
 
-def _refine_arc(arc, tau_fine, min_len, detail_sigma, zone=None):
+def _refine_arc(arc, tau_fine, min_len, detail_sigma, zone=None, scale_map=None):
     """Fine pass over one arc the coarse pass did not claim. Emits the arc's
     points from its start up to (not including) its last point — the caller's
     next edge contributes that."""
@@ -212,10 +250,10 @@ def _refine_arc(arc, tau_fine, min_len, detail_sigma, zone=None):
     poly = cv2.approxPolyDP(arc.reshape(-1, 1, 2).astype(np.int32), tau_fine, False)
     poly = poly.squeeze()
     if poly.ndim != 2 or len(poly) < 2:
-        return _smooth_open(arc[:-1], detail_sigma)
+        return _smooth_open(arc[:-1], _arc_sigma(arc[:-1], detail_sigma, scale_map))
     idx = _vertex_indices(arc, poly, start=0, wrap=False)
     if idx is None:
-        return _smooth_open(arc[:-1], detail_sigma)
+        return _smooth_open(arc[:-1], _arc_sigma(arc[:-1], detail_sigma, scale_map))
 
     out = []
     for a in range(len(poly) - 1):
@@ -224,13 +262,13 @@ def _refine_arc(arc, tau_fine, min_len, detail_sigma, zone=None):
                 and (len(sub) == 0 or _arc_in_zone(sub, zone))):
             out.append(poly[a].reshape(1, 2).astype(np.float64))
         else:
-            out.append(_smooth_open(sub, detail_sigma) if len(sub)
+            out.append(_smooth_open(sub, _arc_sigma(sub, detail_sigma, scale_map)) if len(sub)
                        else poly[a].reshape(1, 2).astype(np.float64))
-    return np.vstack(out) if out else _smooth_open(arc[:-1], detail_sigma)
+    return np.vstack(out) if out else _smooth_open(arc[:-1], _arc_sigma(arc[:-1], detail_sigma, scale_map))
 
 
 def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0,
-                       zone=None):
+                       zone=None, scale_map=None):
     """Straighten a contour's architectural runs, preserve its detail runs."""
     pts = contour.squeeze()
     if pts.ndim != 2 or len(pts) < 8:
@@ -256,20 +294,21 @@ def regularize_contour(contour, tau_fine, tau_coarse, min_len, detail_sigma=0.0,
         elif len(arc) == 0:
             out.append(poly[a].reshape(1, 2).astype(np.float64))
         else:
-            out.append(_refine_arc(np.vstack([arc, pts[idx[b]]]),
-                                   tau_fine, min_len, detail_sigma, zone=zone))
+            out.append(_refine_arc(np.vstack([arc, pts[idx[b]]]), tau_fine, min_len,
+                                   detail_sigma, zone=zone, scale_map=scale_map))
     return np.vstack(out)
 
 
 def _regularize_bounded(contour, tau_fine, tau_coarse, min_len, detail_sigma,
-                        zone=None, max_area_delta=MAX_AREA_DELTA):
+                        zone=None, scale_map=None, max_area_delta=MAX_AREA_DELTA):
     """Regularise one contour, backing off the tolerances until the area it costs
     is acceptable. Returns None if even the smallest scale overshoots, so the
     caller keeps the original boundary rather than damaging the shape."""
     a0 = abs(cv2.contourArea(contour))
     for scale in RETRY_SCALES:
         reg = regularize_contour(contour, tau_fine * scale, tau_coarse * scale,
-                                 min_len, detail_sigma * scale, zone=zone)
+                                 min_len, detail_sigma * scale, zone=zone,
+                                 scale_map=scale_map)
         if reg is None or len(reg) < 3:
             continue
         if a0 <= 0:
@@ -305,6 +344,10 @@ def regularize_mask(mask_img, straighten_zone=None, tau_fine_frac=TAU_FINE_FRAC,
     min_len = max(8.0, min_len_frac * d)
     detail_sigma = detail_sigma_frac * d
 
+    # Smoothing is capped per-arc by the LOCAL feature width, not by this global
+    # sigma alone, so fine structure (twig gaps, thin wall slivers) survives.
+    scale_map = _local_scale_map(binary, 2.0 * detail_sigma) if detail_sigma > 0 else None
+
     cnts, hier = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     if hier is None or not cnts:
         return mask_img
@@ -323,7 +366,8 @@ def regularize_mask(mask_img, straighten_zone=None, tau_fine_frac=TAU_FINE_FRAC,
     # which a flat outer-then-holes pass would erase.
     for i in sorted(range(len(cnts)), key=depth):
         reg = _regularize_bounded(cnts[i], tau_fine, tau_coarse, min_len,
-                                  detail_sigma, zone=straighten_zone)
+                                  detail_sigma, zone=straighten_zone,
+                                  scale_map=scale_map)
         if reg is None or len(reg) < 3:
             reg = cnts[i].squeeze()
             if reg.ndim != 2 or len(reg) < 3:

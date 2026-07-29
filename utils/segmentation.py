@@ -594,6 +594,42 @@ def keep_significant_components(mask_img, image_area, frac_image=0.0005, min_abs
             out[labels == i] = 255
     return out
 
+def prune_speckles(mask_uint8, image_area, protect_zone=None,
+                   frac_image=0.0001, min_abs=64):
+    """Drop speckle islands, but never fine structure.
+
+    A raw area threshold cannot tell a speckle from a legitimate sliver: measured
+    on room 668b83dc, the wall mask had 35 components under the 157px threshold
+    totalling only 373px — and those 373px were the wallpaper visible BETWEEN the
+    twigs of a dried-branch arrangement. Pruning them merged BiRefNet's crisp
+    per-twig cut into one blob, which is why the render showed a cream halo round
+    the plant instead of wallpaper between the branches (cutout perimeter/area
+    fell 0.197 -> 0.155 from this step alone).
+
+    So any component TOUCHING protect_zone survives whole, regardless of area.
+    protect_zone should mark where fine structure legitimately lives — the
+    BiRefNet occluder cutouts and occluder silhouettes — leaving genuine speckles
+    out in open wall, which is what the threshold is for.
+    """
+    binary = (mask_uint8 > 127).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num <= 1:
+        return mask_uint8
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if len(areas) == 0:
+        return np.zeros_like(mask_uint8)
+    thresh = max(min_abs, frac_image * float(image_area))
+    keep = {int(np.argmax(areas)) + 1}
+    for i, a in enumerate(areas, start=1):
+        if a >= thresh:
+            keep.add(i)
+    if protect_zone is not None and protect_zone.any():
+        touched = np.unique(labels[protect_zone > 0])
+        keep.update(int(i) for i in touched if i > 0)
+    out = np.zeros_like(mask_uint8)
+    out[np.isin(labels, list(keep))] = 255
+    return out
+
 def revert_unconfirmed_occluders(mask_uint8, candidates, birefnet_fg,
                                  confirm_frac=OCCLUDER_CONFIRM_FRAC, label=""):
     """Fail CLOSED on the fill-then-cut gamble. Returns (mask, reverted_union).
@@ -1630,12 +1666,18 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             # the saved mask (one measured wall mask kept 395/87/46/13px components
             # against its own 786px threshold). Threshold here is deliberately 5x
             # looser than that pass so it cannot undo the _dropped_wall restore.
-            _pre_prune = mask_uint8.copy()
-            mask_uint8 = keep_significant_components(mask_uint8, image_area,
-                                                    frac_image=0.0001, min_abs=64)
-            if revealed_holes.any():
-                mask_uint8 = cv2.bitwise_or(
-                    mask_uint8, cv2.bitwise_and(_pre_prune, revealed_holes))
+            #
+            # Anything touching a fine occluder cut is exempt: the wall slivers
+            # between a plant's twigs are legitimate sub-threshold components, and
+            # dropping them is what merged BiRefNet's per-twig cut into a blob.
+            _fine = revealed_holes.copy()
+            for _extra in (fg_combined, fg_full, occluder_union, occluder_dilated):
+                if _extra is not None:
+                    _fine = cv2.bitwise_or(_fine, _extra)
+            if _fine.any():
+                _fk = max(3, int(0.004 * max(width, height)))
+                _fine = cv2.dilate(_fine, np.ones((_fk, _fk), np.uint8))
+            mask_uint8 = prune_speckles(mask_uint8, image_area, protect_zone=_fine)
         except Exception as e:
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8
