@@ -7,8 +7,6 @@ import torch
 import numpy as np
 from PIL import Image
 
-from utils.mask_geometry import regularize_mask
-
 # Global variables to hold the models in memory
 _models_loaded = False
 processor = None
@@ -47,22 +45,35 @@ SUB_CATEGORY = {
     "door": "e1f2c3d4-5678-4abc-9def-1234567890ab"
 }
 
-# Objects that commonly OCCLUDE surfaces (plants, trees, vases, pots). They are
-# segmented precisely and SUBTRACTED from surface masks, so a plant/vase yields
-# a tight silhouette cut instead of one large rectangular bite.
-OCCLUDER_OBJECTS = {"plant", "tree", "flower", "palm", "pot", "flowerpot", "vase"}
+# Objects that commonly OCCLUDE surfaces. They are segmented precisely and
+# SUBTRACTED from surface masks, so an object yields a tight silhouette cut
+# instead of one large rectangular bite.
+OCCLUDER_OBJECTS = {
+    "plant", "tree", "flower", "palm", "pot", "flowerpot", "vase",
+    "lamp", "light", "floor lamp", "table lamp", "chandelier", "sconce",
+    "fan", "ceiling fan",
+    "wardrobe", "cabinet", "closet", "cupboard", "chest", "chest of drawers",
+    "bookcase", "bookshelf", "shelf", "shelving",
+    "refrigerator", "fridge", "washing machine",
+    "sofa", "couch", "armchair", "chair", "bench",
+    "table", "desk", "counter", "countertop",
+    "bed", "headboard",
+    "television", "tv", "monitor", "screen",
+    "door", "sliding door",
+    "radiator", "air conditioner", "ac unit",
+}
 
-# Decorative/furniture objects that commonly occlude WALL or CURTAIN surfaces
-# and may have attached fine detail with no EoMT label of its own (e.g. a
-# plant growing from a labeled "vase"). Re-checked via BiRefNet on whichever
-# surface(s) they overlap, using one cached detection per real object shared
-# across surfaces — see get_cached_occluder_fg.
-BIREFNET_RECHECK_LABELS = {
-    "lamp", "floor lamp", "table lamp", "light", "chandelier",
-    "sconce", "wall lamp", "wall light", "pendant", "pendant light",
-    "vase", "plant", "potted plant", "tree", "flower", "branch",
-    "sculpture", "statue", "figurine", "candle", "candlestick",
-    "stand", "tripod", "pot", "flowerpot",
+# The subset of OCCLUDER_OBJECTS worth spending a BiRefNet pass on: objects with
+# genuinely fine structure, where a blob silhouette is visibly wrong. Solid
+# furniture is deliberately excluded — a blob IS the correct silhouette for a
+# sofa, so a BiRefNet call there costs a crop of inference for no visible gain.
+# Measured on room 668b83dc: BiRefNet resolved a dried-branch arrangement down to
+# ~4.6px twigs (cutout perimeter/area 0.197) where OneFormer's own pixels and a
+# SAM box prompt both returned one amoeba-shaped blob.
+BIREFNET_OCCLUDER_LABELS = {
+    "plant", "tree", "flower", "palm", "branch", "pot", "flowerpot", "vase",
+    "lamp", "light", "floor lamp", "table lamp", "chandelier", "sconce",
+    "pendant", "fan", "ceiling fan",
 }
 
 # Surfaces whose extent OneFormer is trusted to define (these are large "stuff"
@@ -73,24 +84,6 @@ ONEFORMER_EXTENT_CLASSES = {"wall", "floor", "curtain"}
 # Surfaces from which precise occluder silhouettes should be subtracted.
 OCCLUDER_SUBTRACT_CLASSES = {"curtain", "wall"}
 
-# Neighbours whose shared boundary with a surface is a genuine straight
-# architectural edge, and may therefore be straightened by mask_geometry. Anything
-# absent from this set — furniture, lamps, plants, mirrors, wall art, and CURTAIN
-# FABRIC — bounds the surface with an organic contour that must survive verbatim.
-# Verified why this has to be semantic rather than geometric: a torn soffit edge
-# (sagitta/length 0.069, one-sided 1.00) and an oval mirror's arc (0.066, 1.00) are
-# numerically identical, so no curvature threshold can separate them.
-STRAIGHTEN_AGAINST_LABELS = {
-    "wall", "ceiling", "floor", "flooring", "window", "windowpane",
-    "door", "doorframe", "skirting", "baseboard", "column", "beam", "pillar",
-}
-
-# Surfaces whose own outline is architectural enough to straighten at all. A
-# curtain is fabric — its edges are folds and hems, and the same physical boundary
-# a wall must preserve against a curtain would be "against a wall" from the
-# curtain's side — so curtains get detail smoothing only, never straightening.
-STRAIGHTEN_SURFACE_CLASSES = {"wall", "floor", "rug", "window", "door"}
-
 OCCLUDER_MIN_AREA = 0.0005     # ignore occluder segments below 0.05% of the image
 SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
 
@@ -99,12 +92,6 @@ SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
 # window in a wall) and MUST stay cut out. Floor/rug are kept tight so furniture
 # is never swallowed; vertical surfaces allow slightly larger fold/gap fills.
 DEFAULT_HOLE_FILL_FRAC = 0.003
-
-# Share of a labeled occluder that BiRefNet must claim before Step 1's decision to
-# fill OVER that object is trusted. Below this the fill is reverted and the object
-# is put back outside the mask — see revert_unconfirmed_occluders.
-OCCLUDER_CONFIRM_FRAC = 0.35
-
 HOLE_FILL_FRAC = {
     "floor": 0.0015,
     "rug": 0.0015,
@@ -126,17 +113,21 @@ def load_models_if_needed():
     global _models_loaded, processor, segmenter, sam_predictor
     if _models_loaded: return
 
-    print(f"➡ [INFO] Loading EoMT & SAM-HQ models to {device.upper()}...")
-    from transformers import EomtForUniversalSegmentation, AutoImageProcessor
+    print(f"➡ [INFO] Loading OneFormer & SAM-HQ models to {device.upper()}...")
+    from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
     from segment_anything_hq import sam_model_registry, SamPredictor # type:ignore
 
-    # Load EoMT (panoptic, ADE20K) — drop-in replacement for OneFormer
-    processor = AutoImageProcessor.from_pretrained("tue-mps/ade20k_panoptic_eomt_large_640")
-    segmenter = EomtForUniversalSegmentation.from_pretrained("tue-mps/ade20k_panoptic_eomt_large_640").to(device)
+    # Load OneFormer. Its processor resizes to shortest_edge 800 / longest_edge
+    # 1333 and the pixel decoder predicts masks at 1/4 stride, so mask cells land
+    # around 5px on a 1536px upload — roughly twice as fine per axis as the fixed
+    # 160x160 grid a 640px EoMT produces, which is why thin structure survives.
+    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
+    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
 
-    # Load SAM-HQ — patch torch.load so CPU-only machines work
-    sam_checkpoint = "sam_hq_vit_b.pth"
-    model_type = "vit_b"
+    # Load SAM-HQ (ViT-B — keeps per-worker VRAM close to the previous stack,
+    # which matters because every gunicorn worker loads its own copy)
+    sam_checkpoint = os.getenv("SAM_HQ_CHECKPOINT", "sam_hq_vit_b.pth")
+    model_type = os.getenv("SAM_HQ_MODEL_TYPE", "vit_b")
     _orig_load = torch.load
     torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "map_location": device})
     try:
@@ -145,7 +136,7 @@ def load_models_if_needed():
         torch.load = _orig_load
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
-    
+
     print("✅ [SUCCESS] All Models Loaded Successfully!")
     _models_loaded = True
 
@@ -179,7 +170,7 @@ def get_metric_depth(image_cv2):
     return depth.cpu().numpy()
 
 BIREFNET_MODEL_ID = "ZhengPeng7/BiRefNet_lite"
-BIREFNET_INPUT_SIZE = 512  # reduce for CPU; use 1024 on GPU for best quality
+BIREFNET_INPUT_SIZE = 512  # do NOT raise: 1024 OOMs under multi-worker gunicorn
 
 def load_birefnet_if_needed():
     global _birefnet
@@ -194,7 +185,7 @@ def load_birefnet_if_needed():
     print("✅ [INFO] BiRefNet-lite loaded.")
 
 def birefnet_fg_mask(image_pil, out_hw):
-    """Run BiRefNet on a PIL image; return uint8 fg mask resized to out_hw (H, W)."""
+    """Run BiRefNet on a PIL crop; return a uint8 fg mask resized to out_hw (H, W)."""
     import torchvision.transforms.functional as TF
     s = BIREFNET_INPUT_SIZE
     img = image_pil.convert("RGB").resize((s, s))
@@ -207,86 +198,18 @@ def birefnet_fg_mask(image_pil, out_hw):
     mask = (pred > 0.5).astype(np.uint8) * 255
     return cv2.resize(mask, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_LINEAR)
 
-def find_occluder_candidates(segmentation_map, segments_info, id2label, exclude_seg_id, label_set, bbox, region_mask=None):
-    """Find every real occluder object — by connected component, not just by
-    segment id — whose pixels meaningfully overlap the given surface bbox. A
-    single EoMT instance can merge multiple physically separate objects under
-    one id (two potted plants on opposite sides of a room both labeled
-    "plant"); splitting by connected component keeps them distinct so a
-    smaller-but-real object isn't discarded just because a bigger one shares
-    its label. Returns a list of (segment_id, component_label, bbox, pixel_area)
-    tuples, each using that object's own FULL, unclipped extent (not cropped
-    to the surface's bbox — clipping can truncate an object right at the
-    boundary, e.g. a vase whose base sits below a curtain's hem).
+def birefnet_detect_object(image, raw_component_mask, obj_bbox, known_area, width, height):
+    """BiRefNet foreground detection for one object, with expand-and-retry.
 
-    region_mask (optional): the surface's own true, possibly non-rectangular
-    extent (with tolerance), used INSTEAD of the bbox rectangle for the
-    overlap test. bbox alone can't tell a real occluder from an object
-    sitting in a totally unrelated part of the same oversized bounding box —
-    verified: a vase on a table in front of a curtain still got treated as a
-    wall candidate (and sent through a full BiRefNet pass) purely because
-    EoMT merged the whole room's wall into one segment spanning past the
-    curtain gap, and the bbox of that segment covers the vase's location
-    too. Omit for surfaces whose bbox is already a reasonable proxy for
-    their extent (curtain)."""
-    x1, y1, x2, y2 = bbox
-    region = (region_mask > 0) if region_mask is not None else None
-    candidates = []
-    for seg in segments_info:
-        if seg["id"] == exclude_seg_id:
-            continue
-        lbl = get_label_from_id(id2label, seg["label_id"])
-        if not label_matches(lbl, label_set):
-            continue
-        seg_bool_full = (segmentation_map == seg["id"])
-        if region is not None:
-            if not np.logical_and(seg_bool_full, region).any():
-                continue
-        elif not seg_bool_full[y1:y2 + 1, x1:x2 + 1].any():
-            continue
-        seg_mask_full = seg_bool_full.astype(np.uint8)
-        num_cc, labels_cc = cv2.connectedComponents(seg_mask_full)
-        if num_cc <= 1:
-            continue
-        crop_labels = labels_cc[region] if region is not None else labels_cc[y1:y2 + 1, x1:x2 + 1]
-        crop_labels = crop_labels[crop_labels > 0]
-        if crop_labels.size == 0:
-            continue
-        overlap_counts = np.bincount(crop_labels)
-        for label_id in np.nonzero(overlap_counts)[0]:
-            if overlap_counts[label_id] < 100:  # filters stray/noise pixels
-                continue
-            component_bool = (labels_cc == label_id)
-            ys, xs = np.where(component_bool)
-            candidates.append((
-                seg["id"],
-                int(label_id),
-                (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
-                int(component_bool.sum()),
-                component_bool.astype(np.uint8) * 255,
-            ))
-    return candidates
+    A labeled object can be much smaller than the real visual occluder it belongs
+    to (foliage growing from a labeled "vase", which the panoptic model drops to
+    void), so a too-tight first crop truncates it. But a tiny confident nub can be
+    non-empty and not touch the crop border, satisfying a naive "done" check before
+    the crop was ever widened — so "done" requires covering a meaningful share of
+    what is already known to be labeled there, not just ">0 px".
 
-def birefnet_detect_object(
-    image,
-    raw_component_mask,
-    obj_bbox,
-    known_area,
-    width,
-    height,
-):
-    """BiRefNet foreground detection for a single object, with expand-and-
-    retry. A labeled object (e.g. "vase") can be much smaller than the real
-    visual occluder it's part of (a plant growing from it with no label of
-    its own — EoMT drops thin/sparse foliage to void); a too-tight first crop
-    truncates it. But a tiny confident nub (a few px in the darkest part of a
-    leaf) can be non-empty and not touch the crop border, satisfying a naive
-    "done" check before the crop was ever widened enough to see the rest —
-    so "done" requires the detection to cover a meaningful share of what we
-    already know is labeled there (known_area), not just ">0 px". Tracks the
-    largest result seen as a fallback in case no attempt clears that bar
-    (e.g. a too-large later retry dilutes the object back into nothing).
-    Returns (cx1, cy1, cx2, cy2, fg_crop) in image coordinates."""
+    Returns (cx1, cy1, cx2, cy2, fg_crop) in image coordinates.
+    """
     ox1, oy1, ox2, oy2 = obj_bbox
     best_fg_crop, best_box, best_area = None, None, -1
     min_good_area = max(50, int(0.4 * known_area))
@@ -298,15 +221,12 @@ def birefnet_detect_object(
         cx2 = min(width, ox2 + pad); cy2 = min(height, oy2 + pad)
         if first_box is None:
             first_box = (cx1, cy1, cx2, cy2)
-        crop_pil = image.crop((cx1, cy1, cx2, cy2))
-        fg_crop = birefnet_fg_mask(crop_pil, (cy2 - cy1, cx2 - cx1))
+        fg_crop = birefnet_fg_mask(image.crop((cx1, cy1, cx2, cy2)), (cy2 - cy1, cx2 - cx1))
         area = int(np.count_nonzero(fg_crop))
-        # A detection covering nearly the whole crop is a degenerate/failed
-        # result — BiRefNet found nothing distinctly salient and defaulted
-        # to "everything" — not a real thin-object silhouette (a branch, a
-        # thin stand). Never trust it, not even as a last-resort fallback:
-        # blanking out a whole rectangle of curtain/wall around a thin
-        # object is worse than detecting nothing there.
+        # A detection covering nearly the whole crop is a degenerate result — the
+        # model found nothing distinctly salient and defaulted to "everything".
+        # Never trust it, not even as a fallback: blanking a whole rectangle of
+        # wall around a thin object is worse than detecting nothing there.
         crop_pixels = (cy2 - cy1) * (cx2 - cx1)
         degenerate = area > 0.85 * crop_pixels
         if area > best_area and not degenerate:
@@ -319,79 +239,32 @@ def birefnet_detect_object(
         if not degenerate and ((area >= min_good_area and not touches_edge) or full_frame):
             break
         pad_frac *= 2.2
+
     if best_box is None:
         # Every attempt was degenerate — detect nothing rather than guess.
         cx1, cy1, cx2, cy2 = first_box
-        best_fg_crop = np.zeros((cy2 - cy1, cx2 - cx1), np.uint8)
-        best_box = first_box
-    else:
-        # Sanity-check the WINNING attempt only, once — never mid-loop (a
-        # per-attempt version tried earlier let a later, genuinely worse
-        # attempt's raw-EoMT substitution outbid an already-good earlier
-        # attempt purely by pixel count).
-        #
-        # Two independent signals, either one enough to reject:
-        # 1. Total area vs known_area — catches a near-total miss (the
-        #    object barely detected at all: <1% kept).
-        # 2. Spatial extent vs the object's own known bbox — catches a
-        #    PARTIAL miss that (1) alone can't see: a lamp's shade found
-        #    but its base/pole never detected AT ALL is still ~wide (the
-        #    shade spans the object's full width) so area alone can land
-        #    anywhere from 20-50% and slip past a pure area threshold: this
-        #    exact case measured 22% height coverage against >=90% for
-        #    every confirmed-legitimate trim (a vase's decorative ring cut
-        #    out kept 100%/173%; a lamp's shade+arm kept 100%/100%; a
-        #    lamp's pole+base — trimmed down from a fatter raw disc, not a
-        #    hole and not confined to a slim boundary ring, yet still a
-        #    correct trim — kept 90%/107%). A genuine miss never reaches
-        #    across the full extent of what EoMT already knows is there;
-        #    a legitimate trim (thinner, or with a hole) always does.
-        cx1, cy1, cx2, cy2 = best_box
-        area_ratio = best_area / known_area
-        fys, fxs = np.where(best_fg_crop > 0)
-        known_h, known_w = max(1, oy2 - oy1), max(1, ox2 - ox1)
-        if len(fys) == 0:
-            extent_frac = 0.0
-        else:
-            height_frac = (fys.max() - fys.min()) / known_h
-            width_frac = (fxs.max() - fxs.min()) / known_w
-            extent_frac = min(height_frac, width_frac)
-        if area_ratio < 0.2 or extent_frac < 0.5:
-            best_fg_crop = raw_component_mask[cy1:cy2, cx1:cx2].copy()
-    cx1, cy1, cx2, cy2 = best_box
-    return cx1, cy1, cx2, cy2, best_fg_crop
+        return cx1, cy1, cx2, cy2, np.zeros((cy2 - cy1, cx2 - cx1), np.uint8)
 
-def get_cached_occluder_fg(
-    cache,
-    segment_id,
-    component_label,
-    raw_component_mask,
-    obj_bbox,
-    known_area,
-    image,
-    width,
-    height,
-):
-    """The same physical object often overlaps more than one surface's bbox
-    (a sconce straddling the seam between two adjacent curtain panels, or a
-    plant behind both a curtain and the wall next to it). Cache BiRefNet's
-    detection per (segment_id, component_label) so a given object only ever
-    runs through the model once per image, and every surface touching it
-    gets the identical, best-quality result instead of a second independent
-    — and possibly different-quality — detection."""
-    key = (segment_id, component_label)
-    if key in cache:
-        return cache[key]
-    result = birefnet_detect_object(
-        image,
-        raw_component_mask,
-        obj_bbox,
-        known_area,
-        width,
-        height,
-    )
-    cache[key] = result
-    return result
+    # Sanity-check the WINNING attempt only. Two independent signals, either one
+    # enough to reject and fall back to the panoptic model's own pixels:
+    #   1. total area vs known_area — catches a near-total miss.
+    #   2. spatial extent vs the object's own bbox — catches a PARTIAL miss that
+    #      area alone cannot see (a lamp's shade found but its pole never detected
+    #      is still ~full width, so area lands mid-range and slips past an
+    #      area-only threshold). A genuine miss never reaches across the full
+    #      extent already known to be there; a legitimately thinner-or-holed
+    #      silhouette always does.
+    cx1, cy1, cx2, cy2 = best_box
+    area_ratio = best_area / max(1, known_area)
+    fys, fxs = np.where(best_fg_crop > 0)
+    known_h, known_w = max(1, oy2 - oy1), max(1, ox2 - ox1)
+    if len(fys) == 0:
+        extent_frac = 0.0
+    else:
+        extent_frac = min((fys.max() - fys.min()) / known_h, (fxs.max() - fxs.min()) / known_w)
+    if area_ratio < 0.2 or extent_frac < 0.5:
+        best_fg_crop = raw_component_mask[cy1:cy2, cx1:cx2].copy()
+    return cx1, cy1, cx2, cy2, best_fg_crop
 
 def find_ade20k_id(label_name, id2label):
     possible_names = TARGET_OBJECTS.get(label_name, [label_name])
@@ -423,31 +296,28 @@ def generate_color_map(segmentation_map, found_objects):
         color_map[mask] = colors[color_idx]
     return color_map
 
-def save_eomt_label_debug(image_cv, segmentation_map, segments_info, id2label, out_path):
-    """Every EoMT segment, colored, with its raw label text drawn at its
-    centroid — over the original photo at reduced opacity. For diagnosing
-    what EoMT actually called a given region (e.g. is a stray blob labeled
-    "plant", "curtain", or "wall") rather than inferring it from mask shape."""
+def save_panoptic_label_debug(image_cv, segmentation_map, segments_info, id2label, out_path):
+    """Every panoptic segment, coloured, with its raw label text drawn at its
+    centroid, over the original photo at reduced opacity. For diagnosing what the
+    model actually called a region rather than inferring it from mask shape."""
     h, w = segmentation_map.shape
     np.random.seed(7)
     colors = np.random.randint(60, 255, size=(300, 3))
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
     for seg in segments_info:
-        seg_id = seg["id"]
-        mask = (segmentation_map == seg_id)
+        mask = (segmentation_map == seg["id"])
         if not mask.any():
             continue
-        overlay[mask] = colors[seg_id % 300]
+        overlay[mask] = colors[seg["id"] % 300]
     blended = cv2.addWeighted(image_cv, 0.45, overlay, 0.55, 0)
     for seg in segments_info:
-        seg_id = seg["id"]
-        mask = (segmentation_map == seg_id)
+        mask = (segmentation_map == seg["id"])
         if not mask.any():
             continue
         label = get_label_from_id(id2label, seg["label_id"])
         ys, xs = np.where(mask)
         cx, cy = int(xs.mean()), int(ys.mean())
-        text = f"{label}#{seg_id}"
+        text = f"{label}#{seg['id']}"
         cv2.putText(blended, text, (cx - 4 * len(text), cy), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(blended, text, (cx - 4 * len(text), cy), cv2.FONT_HERSHEY_SIMPLEX,
@@ -455,11 +325,11 @@ def save_eomt_label_debug(image_cv, segmentation_map, segments_info, id2label, o
     cv2.imwrite(out_path, blended)
 
 def isolate_largest_blob(mask_img):
-    _, binary = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)  
+    _, binary = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) # Find all external contours
-    
+
     if not contours: return mask_img # Return original if somehow empty
-    
+
     largest_contour = max(contours, key=cv2.contourArea) # Identify the contour with the maximum area
     clean_mask = np.zeros_like(mask_img) # Create a fresh black mask of the same dimensions
 
@@ -469,15 +339,15 @@ def isolate_largest_blob(mask_img):
 def fill_internal_holes(mask_img):
     _, binary_mask = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY) # Ensure the mask is strictly binary (0 or 255)
     padded = cv2.copyMakeBorder(binary_mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0) # Pad the image with a 1-pixel black border.
-    
+
     h, w = padded.shape[:2]
     flood_mask = np.zeros((h+2, w+2), np.uint8)
-    
+
     cv2.floodFill(padded, flood_mask, (0,0), 255)
-    
+
     im_floodfill = padded[1:h-1, 1:w-1] # Remove the padding to restore original dimensions
     im_floodfill_inv = cv2.bitwise_not(im_floodfill) # Invert the flood-filled image. Now, only the enclosed holes are white.
-    
+
     filled_mask = binary_mask | im_floodfill_inv # Bitwise OR combines the original mask with the isolated holes
     return isolate_largest_blob(filled_mask)
 
@@ -503,56 +373,6 @@ def fill_enclosed_holes(mask_img):
     flood = flood[1:h - 1, 1:w - 1]
     holes = cv2.bitwise_not(flood)
     return binary_mask | holes
-
-def find_enclosed_holes(mask_img):
-    """Return just the fully-enclosed interior holes of mask_img (not the
-    filled result) — pixels that are 0 but unreachable from the image
-    border without crossing a 255 pixel. Used to recover a genuine physical
-    opening in a detected occluder (e.g. a vase's decorative ring cutout)
-    that lets the surface behind it show through: BiRefNet's own per-object
-    prediction can already mark that gap correctly as non-occluder, but as
-    an isolated island fully surrounded by occluder pixels it's exactly the
-    shape an earlier keep_significant_components pass (run right after the
-    SAM-based occluder subtraction, well before BiRefNet) drops as an
-    insignificant disconnected component — silently losing it regardless of
-    what BiRefNet finds later. Recomputing the hole directly from the final
-    occluder shape and re-adding it to the surface mask recovers it
-    regardless of when upstream it was dropped."""
-    _, binary_mask = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
-    padded = cv2.copyMakeBorder(binary_mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    h, w = padded.shape[:2]
-    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-    flood = padded.copy()
-    cv2.floodFill(flood, flood_mask, (0, 0), 255)
-    flood = flood[1:h - 1, 1:w - 1]
-    return cv2.bitwise_not(flood)
-
-def reveal_occluder_holes(occluder_mask, surface_extent_mask):
-    """Enclosed holes in an occluder's shape are only sometimes a
-    legitimate see-through gap onto the surface — a vase's decorative
-    cutout sits entirely over the curtain (revealing it is correct), but a
-    thin sparse object (a branch) can straddle the surface's own true edge,
-    with some of its inter-twig gaps opening onto the surface and others
-    opening onto whatever is past the surface's edge (a window). Revealing
-    those would incorrectly paint surface texture past where the surface
-    actually is. surface_extent_mask must be the surface's OWN mask from
-    BEFORE any occluder subtraction (its natural, un-occluded span) — a
-    hole is only revealed if its horizontal span falls (almost) entirely
-    within columns that span actually reaches at some row."""
-    holes = find_enclosed_holes(occluder_mask)
-    if not holes.any():
-        return holes
-    col_reach = surface_extent_mask.any(axis=0)
-    num, labels = cv2.connectedComponents(holes)
-    revealed = np.zeros_like(holes)
-    for i in range(1, num):
-        blob = labels == i
-        if int(blob.sum()) < 20:
-            continue
-        cols = np.unique(np.where(blob)[1])
-        if col_reach[cols].mean() >= 0.9:
-            revealed[blob] = 255
-    return revealed
 
 def fill_small_holes(mask_img, image_area, max_hole_frac=DEFAULT_HOLE_FILL_FRAC):
     """Fill enclosed holes ONLY if they are smaller than max_hole_frac of the
@@ -593,89 +413,6 @@ def keep_significant_components(mask_img, image_area, frac_image=0.0005, min_abs
         if a >= thresh:
             out[labels == i] = 255
     return out
-
-def prune_speckles(mask_uint8, image_area, protect_zone=None,
-                   frac_image=0.0001, min_abs=64):
-    """Drop speckle islands, but never fine structure.
-
-    A raw area threshold cannot tell a speckle from a legitimate sliver: measured
-    on room 668b83dc, the wall mask had 35 components under the 157px threshold
-    totalling only 373px — and those 373px were the wallpaper visible BETWEEN the
-    twigs of a dried-branch arrangement. Pruning them merged BiRefNet's crisp
-    per-twig cut into one blob, which is why the render showed a cream halo round
-    the plant instead of wallpaper between the branches (cutout perimeter/area
-    fell 0.197 -> 0.155 from this step alone).
-
-    So any component TOUCHING protect_zone survives whole, regardless of area.
-    protect_zone should mark where fine structure legitimately lives — the
-    BiRefNet occluder cutouts and occluder silhouettes — leaving genuine speckles
-    out in open wall, which is what the threshold is for.
-    """
-    binary = (mask_uint8 > 127).astype(np.uint8)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if num <= 1:
-        return mask_uint8
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    if len(areas) == 0:
-        return np.zeros_like(mask_uint8)
-    thresh = max(min_abs, frac_image * float(image_area))
-    keep = {int(np.argmax(areas)) + 1}
-    for i, a in enumerate(areas, start=1):
-        if a >= thresh:
-            keep.add(i)
-    if protect_zone is not None and protect_zone.any():
-        touched = np.unique(labels[protect_zone > 0])
-        keep.update(int(i) for i in touched if i > 0)
-    out = np.zeros_like(mask_uint8)
-    out[np.isin(labels, list(keep))] = 255
-    return out
-
-def revert_unconfirmed_occluders(mask_uint8, candidates, birefnet_fg,
-                                 confirm_frac=OCCLUDER_CONFIRM_FRAC, label=""):
-    """Fail CLOSED on the fill-then-cut gamble. Returns (mask, reverted_union).
-
-    Step 1 of the wall and curtain paths deliberately fills OVER every segment in
-    BIREFNET_RECHECK_LABELS — lamp, vase, flower, sconce, plant — because EoMT
-    often bleeds an object's label onto the surface right beside it, and
-    filling-then-precisely-recutting recovers that fabric. The bet is that Step 2's
-    BiRefNet pass carves the object back out. When the bet loses, the object keeps
-    surface texture and nothing downstream can catch it: the _OCC_POST and wall
-    cleanup passes deliberately KEEP these labels, so the label-based safety net is
-    switched off for exactly the classes that stand in front of walls and curtains.
-
-    Verified on room da5c6d5d: BiRefNet found lamp#29 cleanly but missed flower#24
-    entirely, so the flowers kept curtain texture. A colour/appearance veto cannot
-    rescue this — measured on that room's own saved photo crops, a/b chromaticity
-    spread across a whole crop is only 2-8 units because curtain, lamp, flowers and
-    wall are all neutral cream, and k-means on Lab separates shadow from highlight
-    rather than object from surface.
-
-    So the discriminator has to be the label EoMT already produced and the pipeline
-    was throwing away. For every occluder component Step 1 filled over, measure how
-    much of it BiRefNet actually claimed; if it fell short, restore the exclusion.
-    Losing a little genuine fabric beside an object is the right trade against
-    painting over the object itself.
-    """
-    reverted = np.zeros_like(mask_uint8)
-    if not candidates:
-        return mask_uint8, reverted
-    n = 0
-    for cand in candidates:
-        raw = cand[4]
-        known = int(np.count_nonzero(raw))
-        if known <= 0:
-            continue
-        claimed = 0
-        if birefnet_fg is not None:
-            claimed = int(np.count_nonzero(cv2.bitwise_and(raw, birefnet_fg)))
-        if claimed / float(known) < confirm_frac:
-            reverted = cv2.bitwise_or(reverted, raw)
-            n += 1
-    if n:
-        mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(reverted))
-        print(f"[FAIL-CLOSED] {label}: reverted {n}/{len(candidates)} occluder "
-              f"fill(s) BiRefNet did not confirm")
-    return mask_uint8, reverted
 
 def _guided_filter(I, p, radius, eps):
     ksize = (2 * radius + 1, 2 * radius + 1)
@@ -745,12 +482,12 @@ def _sam_predict_safe(predictor, points, labels, box, mask_input):
     pc = np.array(points) if points else None
     pl = np.array(labels) if labels else None
     try:
-        return predictor.predict(point_coords=pc, point_labels=pl, box=box, mask_input=mask_input, multimask_output=True)
+        return predictor.predict(point_coords=pc, point_labels=pl, box=box, mask_input=mask_input, multimask_output=True, hq_token_only=True)
     except Exception:
         try:
-            return predictor.predict(point_coords=pc, point_labels=pl, box=box, multimask_output=True)
+            return predictor.predict(point_coords=pc, point_labels=pl, box=box, multimask_output=True, hq_token_only=True)
         except Exception:
-            return predictor.predict(box=box, multimask_output=True)
+            return predictor.predict(box=box, multimask_output=True, hq_token_only=True)
 
 def _best_iou_index(masks, of_bool):
     best_idx, best_iou = 0, -1.0
@@ -803,10 +540,27 @@ def refine_with_sam(predictor, of_bool, bbox, neg_points, image_shape, shrink_gu
         refined = constrained
     return refined.astype(np.uint8) * 255
 
+def build_occluder_union_of(occluder_segments, segmentation_map):
+    """Raw OneFormer-pixel union (no SAM expansion).
+    OneFormer assigns inter-leaf gap pixels to wall, so this mask correctly
+    excludes them — the SAM blob often fills those gaps, which would subtract
+    real wall pixels and leave visible beige around leaves."""
+    H, W = segmentation_map.shape[:2]
+    if not occluder_segments:
+        return None
+    union = np.zeros((H, W), dtype=np.uint8)
+    for occ in occluder_segments:
+        of_bool = (segmentation_map == occ["segment_id"])
+        if int(of_bool.sum()) == 0:
+            continue
+        union = cv2.bitwise_or(union, of_bool.astype(np.uint8) * 255)
+    return union
+
 def build_occluder_union(predictor, occluder_segments, segmentation_map, image_bgr):
-    """Segment each plant/tree/vase/pot occluder precisely (per-instance, box
-    prompted SAM) and return the union of their refined masks. This is what gets
-    subtracted from curtain/wall masks to produce a tight silhouette cut."""
+    """Segment each occluder precisely (per-instance, box prompted SAM) and return
+    the union of their refined masks. Dilated by the caller and subtracted from
+    CURTAIN, where filling the inter-leaf gaps is wanted so curtain texture does
+    not bleed through onto whatever sits behind the leaves."""
     H, W = segmentation_map.shape[:2]
     if not occluder_segments:
         return None
@@ -844,6 +598,72 @@ def build_occluder_union(predictor, occluder_segments, segmentation_map, image_b
 
     return union
 
+def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil,
+                                 id2label, room_id=None):
+    """Crisp union of the THIN/SPARSE occluders only, via BiRefNet — no dilation.
+
+    This is the one thing subtracted from WALL. Two deliberate restrictions:
+
+      * Only BIREFNET_OCCLUDER_LABELS classes. Solid furniture is already excluded
+        from a wall mask by OneFormer's own labelling, so subtracting a SAM blob
+        for it again buys nothing and risks a silhouette fatter than the object —
+        which is exactly the beige halo the SAM path used to leave around leaves.
+
+      * No dilation, ever. Dilating a thin-object silhouette closes the gaps
+        between twigs, and those gaps are where the wallpaper must stay visible.
+
+    Split by connected component, because the panoptic model merges instances of
+    one class under a single segment id (verified: two separate dried-branch
+    arrangements on opposite sides of a room shared one "plant" id), and a single
+    crop spanning both would frame neither properly.
+    """
+    H, W = segmentation_map.shape[:2]
+    if not occluder_segments:
+        return None
+
+    thin = [o for o in occluder_segments
+            if label_matches(get_label_from_id(id2label, o["label_id"]), BIREFNET_OCCLUDER_LABELS)]
+    if not thin:
+        print("➡ [INFO] No thin/sparse occluders in this scene; wall keeps raw OneFormer pixels.")
+        return None
+
+    load_birefnet_if_needed()
+    union = np.zeros((H, W), dtype=np.uint8)
+    n_done = 0
+    for occ in thin:
+        seg_bool = (segmentation_map == occ["segment_id"])
+        if int(seg_bool.sum()) == 0:
+            continue
+        num_cc, labels_cc = cv2.connectedComponents(seg_bool.astype(np.uint8))
+        for cc in range(1, num_cc):
+            comp = (labels_cc == cc)
+            area = int(comp.sum())
+            if area < 100:  # stray/noise pixels
+                continue
+            ys, xs = np.where(comp)
+            obj_bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+            raw = comp.astype(np.uint8) * 255
+            try:
+                cx1, cy1, cx2, cy2, fg = birefnet_detect_object(
+                    image_pil, raw, obj_bbox, area, W, H)
+            except Exception as e:
+                print(f"⚠ [WARN] BiRefNet occluder detect failed ({e}); using OneFormer pixels.")
+                union = cv2.bitwise_or(union, raw)
+                continue
+            union[cy1:cy2, cx1:cx2] = np.maximum(union[cy1:cy2, cx1:cx2], fg)
+            n_done += 1
+            if DEBUG_SEG and room_id:
+                try:
+                    cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
+                        f"birefnet_input_occluder_{room_id}_{occ['segment_id']}_{cc}.png"),
+                        cv2.cvtColor(np.array(image_pil.crop((cx1, cy1, cx2, cy2))), cv2.COLOR_RGB2BGR))
+                except Exception:
+                    pass
+
+    print(f"➡ [INFO] BiRefNet refined {n_done} thin occluder component(s) "
+          f"from {len(thin)} of {len(occluder_segments)} occluder segment(s)")
+    return union if union.any() else None
+
 def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max_hole_frac=DEFAULT_HOLE_FILL_FRAC):
     """Shared cleanup: bridge small gaps, keep ALL significant components,
     fill only SMALL enclosed holes (so objects on the surface stay cut out),
@@ -859,17 +679,18 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max
     return mask_uint8
 
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
-    
+
     load_models_if_needed() # Ensure models are loaded
-    
+
     width, height = image.size
     image_area = width * height
 
-    # Run EoMT panoptic segmentation
-    inputs = processor(images=image, return_tensors="pt").to(device)
+    # Run OneFormer
+    inputs = processor(images=image, task_inputs=["panoptic"], return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmenter(**inputs)
 
+    # Panoptic post-processing
     panoptic_result = processor.post_process_panoptic_segmentation(
         outputs, target_sizes=[image.size[::-1]]
     )[0]
@@ -899,16 +720,17 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             continue
         seg_area_ratio = seg_count / float(image_area)
 
-        # Collect occluders (plant/tree/vase/pot) for precise subtraction later.
+        # Collect occluders for precise subtraction later.
         if label_matches(model_label, OCCLUDER_OBJECTS) and seg_area_ratio >= OCCLUDER_MIN_AREA:
             rows_o, cols_o = np.where(seg_bool)
             occluder_segments.append({
                 "segment_id": segment_id,
+                "label_id": label_id,
                 "bbox": [int(np.min(cols_o)), int(np.min(rows_o)), int(np.max(cols_o)), int(np.max(rows_o))],
                 "label": model_label,
             })
 
-        # Match target surfaces (wall/floor/curtain/rug/window).
+        # Match target surfaces (wall/floor/curtain/rug/window/door).
         matched_user_label = None
         for user_label in TARGET_OBJECTS.keys():
             if label_id in target_ids[user_label]:
@@ -976,37 +798,41 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
 
     if DEBUG_SEG:
         try:
-            save_eomt_label_debug(image_cv, segmentation_map, segments_info, id2label,
-                os.path.join(_DEBUG_MASK_DIR, f"eomt_labels_{room_id}.png"))
-        except Exception as _eomt_dbg_e:
-            print(f"⚠ [WARN] EoMT label debug image failed ({_eomt_dbg_e}); skipping.")
+            save_panoptic_label_debug(image_cv, segmentation_map, segments_info, id2label,
+                os.path.join(_DEBUG_MASK_DIR, f"oneformer_labels_{room_id}.png"))
+        except Exception as _dbg_e:
+            print(f"⚠ [WARN] Panoptic label debug image failed ({_dbg_e}); skipping.")
 
-    # -> Build occluder masks (plants/vases) ONCE — two variants:
-    #    occluder_dilated : SAM-refined blob + dilation → used for CURTAIN so the
-    #                       curtain fill recovers fabric behind branches/leaves.
-    #    occluder_of      : raw EoMT pixels, no dilation → used for WALL so the
-    #                       inter-branch gap pixels (EoMT labels them as "wall") are
-    #                       NOT removed and still receive the wallpaper texture.
+    # -> Build occluder masks ONCE. Three variants, each for a different consumer:
+    #    occluder_union_of : raw OneFormer pixels (reference/debug only).
+    #    occluder_dilated  : SAM-refined blob + dilation -> CURTAIN, where filling
+    #                        inter-leaf gaps stops curtain texture bleeding through.
+    #    occluder_birefnet : crisp, undilated, thin/sparse classes only -> WALL,
+    #                        where the gaps between twigs must keep their wallpaper.
+    occluder_union_of = build_occluder_union_of(occluder_segments, segmentation_map)
     occluder_union = build_occluder_union(sam_predictor, occluder_segments, segmentation_map, image_cv)
     occluder_dilated = None
-    occluder_of = None
     if occluder_union is not None:
         d = max(2, int(0.002 * max(width, height)))
         occluder_dilated = cv2.dilate(occluder_union, np.ones((d, d), np.uint8))
-    if occluder_segments:
-        _occ_of = np.zeros((height, width), np.uint8)
-        for _oseg in occluder_segments:
-            _occ_of |= (segmentation_map == _oseg["segment_id"]).astype(np.uint8) * 255
-        occluder_of = _occ_of
-        if DEBUG_SEG:
+
+    occluder_birefnet = None
+    try:
+        occluder_birefnet = build_occluder_union_birefnet(
+            occluder_segments, segmentation_map, image, id2label, room_id=room_id)
+    except Exception as _be:
+        print(f"⚠ [WARN] BiRefNet occluder pass failed ({_be}); wall keeps raw OneFormer pixels.")
+
+    if DEBUG_SEG:
+        for _nm, _m in (("occluders", occluder_union),
+                        ("occluders_of", occluder_union_of),
+                        ("occluders_birefnet", occluder_birefnet)):
+            if _m is None:
+                continue
             try:
-                cv2.imwrite(os.path.join(_DEBUG_MASK_DIR, f"occluders_{room_id}.png"),
-                            occluder_union if occluder_union is not None else occluder_of)
+                cv2.imwrite(os.path.join(_DEBUG_MASK_DIR, f"{_nm}_{room_id}.png"), _m)
             except Exception:
                 pass
-
-    # Shared across every hotspot below — see get_cached_occluder_fg.
-    _occluder_fg_cache = {}
 
     # -> Generate the final mask for each hotspot.
     for hotspot in hotspots:
@@ -1031,653 +857,39 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 neg_points.append([ocx, ocy])
 
         try:
-            refined = refine_with_sam(sam_predictor, of_bool, bbox, neg_points, (height, width))
-
-            # For large "stuff" surfaces, OneFormer's extent is the floor: SAM may
-            # crisp/extend edges but must never carve away coverage (this removes
-            # the big plant "bite" from curtains and recovers split wall/floor parts).
-            if seg_class in ONEFORMER_EXTENT_CLASSES:
-                surface = cv2.bitwise_or(refined, of_uint8)
+            # Wall: OneFormer panoptic already gives pixel-perfect wall/plant
+            # separation — no gap at all. SAM refinement and refine_mask_edges both
+            # introduce a gap by avoiding plants. So for wall, use OF pixels
+            # directly, with only morphological closing to fill tiny holes: no SAM,
+            # no edge refinement. The ONE subtraction it gets is the crisp,
+            # undilated BiRefNet silhouette of thin occluders, which resolves the
+            # twigs OneFormer's own grid cannot and leaves their gaps intact.
+            if seg_class == "wall":
+                surface = of_uint8
+                max_hole_frac = HOLE_FILL_FRAC.get(seg_class, DEFAULT_HOLE_FILL_FRAC)
+                mask_uint8 = postprocess_mask(surface, image_cv, image_area,
+                                              max_hole_frac=max_hole_frac, do_edge_refine=False)
+                if occluder_birefnet is not None:
+                    mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_birefnet))
+                    mask_uint8 = keep_significant_components(mask_uint8, image_area)
             else:
-                surface = refined
+                refined = refine_with_sam(sam_predictor, of_bool, bbox, neg_points, (height, width))
 
-            max_hole_frac = HOLE_FILL_FRAC.get(seg_class, DEFAULT_HOLE_FILL_FRAC)
-            mask_uint8 = postprocess_mask(surface, image_cv, image_area, max_hole_frac=max_hole_frac)
-            # Snapshot BEFORE any occluder subtraction — the surface's own
-            # column-reach, used later to tell a legitimate see-through gap
-            # in an occluder (fully inside the surface's own span) apart
-            # from background peeking past where the surface actually ends.
-            pre_occluder_mask = mask_uint8.copy()
+                # For large "stuff" surfaces, OneFormer's extent is the floor: SAM may
+                # crisp/extend edges but must never carve away coverage (this removes
+                # the big plant "bite" from curtains and recovers split wall/floor parts).
+                if seg_class in ONEFORMER_EXTENT_CLASSES:
+                    surface = cv2.bitwise_or(refined, of_uint8)
+                else:
+                    surface = refined
 
-            # Subtract precise occluder silhouettes (plants/vases) from surfaces.
-            if seg_class in OCCLUDER_SUBTRACT_CLASSES:
-                if seg_class == "wall" and occluder_of is not None:
-                    # Raw EoMT pixels — inter-branch/leaf gaps stay as wall so
-                    # wallpaper shows through the vase/plant silhouette.
-                    mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_of))
-                elif occluder_dilated is not None:
-                    # Dilated SAM blob — fills gaps so curtain texture doesn't
-                    # bleed through to objects behind the branches.
+                max_hole_frac = HOLE_FILL_FRAC.get(seg_class, DEFAULT_HOLE_FILL_FRAC)
+                mask_uint8 = postprocess_mask(surface, image_cv, image_area, max_hole_frac=max_hole_frac)
+
+                # Curtain: use dilated SAM mask — fills inter-leaf gaps so curtain doesn't bleed through.
+                if seg_class in OCCLUDER_SUBTRACT_CLASSES and occluder_dilated is not None:
                     mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_dilated))
-                mask_uint8 = keep_significant_components(mask_uint8, image_area)
-
-            # Hard-subtract pixels OF definitively assigned to other objects.
-            # SAM refine can expand ~38px beyond the OF boundary; this prevents it
-            # bleeding into lamps, mirrors, bed, paintings that OF correctly identified.
-            #
-            # VOID is -1, not 0. EoMT ships its own compute_segments (unlike
-            # Mask2Former's, which does start ids at 1): transformers 4.56 builds the
-            # map with `torch.zeros(...) - 1` and assigns `current_segment_id` BEFORE
-            # incrementing, so ids start at 0 and 0 is an ordinary segment — usually
-            # whichever surface scored first, typically the floor (verified: `floor#0`
-            # in the eomt_labels debug overlays). `!= 0` therefore treated that one
-            # real segment as void and never subtracted it from any other surface's
-            # mask, and when segment 0 was itself the hotspot it counted void as
-            # "another object".
-            other_of = ((segmentation_map >= 0) & (segmentation_map != segment_id)).astype(np.uint8) * 255
-            mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(other_of))
-
-            # Wall: subtract foreground objects (plants, vases, lamps…) that EoMT
-            # mislabelled as wall or that SAM expanded into from unlabeled pixels.
-            # Uses the same per-object candidate discovery + cached BiRefNet
-            # detection as the curtain path below, so an object handled once
-            # (for a curtain, say) gets reused here at identical quality instead
-            # of a second, independently-run — and possibly worse — detection.
-            # Union of occluders whose fill BiRefNet failed to confirm. Re-applied
-            # once more at the very end, because the guided-filter pass and the
-            # _OCC_POST / wall cleanup loops below both leave recheck labels alone
-            # and can grow the surface straight back over them.
-            reverted_occluders = np.zeros((height, width), np.uint8)
-
-            fg_combined = None
-            if seg_class == "wall":
-                try:
-                    fg_combined = np.zeros((height, width), np.uint8)
-                    # Fill-first step (ported from the curtain path's Step 1):
-                    # without it, any gap between plant leaves that EoMT left
-                    # void — or a fragment of the wall's own segment dropped by
-                    # keep_significant_components for being too small in
-                    # isolation — never gets a chance to be recovered before
-                    # Step 2's BiRefNet cut runs; it just stays whatever
-                    # `other_of`'s hard-subtract above already zeroed out,
-                    # leaving Step 2's precise silhouette subtracted from a
-                    # ragged, incomplete base instead of a clean filled one.
-                    _wall_region_tol = cv2.dilate(pre_occluder_mask, np.ones((25, 25), np.uint8))
-                    labeled_as_other_wall = np.zeros((height, width), np.uint8)
-                    occluder_labeled_wall = np.zeros((height, width), np.uint8)
-                    for _seg in segments_info:
-                        if _seg["id"] == segment_id:
-                            continue
-                        _lbl = get_label_from_id(id2label, _seg["label_id"])
-                        _seg_bool = (segmentation_map == _seg["id"])
-                        _is_recheck_label = label_matches(_lbl, BIREFNET_RECHECK_LABELS)
-                        # Split by connected component — same granularity
-                        # find_occluder_candidates uses — before testing
-                        # overlap. EoMT can merge multiple physically separate
-                        # objects sharing one label under a single segment id
-                        # (verified: two potted plants AND two free-standing
-                        # decorative vase/branch objects all labeled "plant"
-                        # under one id; also verified: a floor lamp's shade and
-                        # its pole/base labeled as two disconnected components
-                        # sharing one "lamp" id). Testing overlap on the WHOLE
-                        # segment let one component's overlap (the pole,
-                        # genuinely near the wall) vouch for a totally
-                        # unrelated component of the same label (the shade,
-                        # sitting mostly over the window) — promising Step 2
-                        # would cut it, when Step 2's own per-component test
-                        # (rightly) never finds it a candidate at all. Painted
-                        # solid white forever.
-                        _num_cc, _labels_cc = cv2.connectedComponents(_seg_bool.astype(np.uint8))
-                        for _cc_id in range(1, _num_cc):
-                            _comp_bool = (_labels_cc == _cc_id)
-                            _overlap_px = int(np.logical_and(_comp_bool, _wall_region_tol > 0).sum())
-                            if _is_recheck_label and _overlap_px >= 100:
-                                occluder_labeled_wall[_comp_bool] = 255
-                            else:
-                                labeled_as_other_wall[_comp_bool] = 255
-                    wx1, wy1, wx2, wy2 = bbox
-                    bbox_fill_wall = np.zeros((height, width), np.uint8)
-                    bbox_fill_wall[wy1:wy2 + 1, wx1:wx2 + 1] = 255
-                    hole_wall = cv2.bitwise_and(bbox_fill_wall, cv2.bitwise_not(mask_uint8))
-                    hole_wall = cv2.bitwise_and(hole_wall, cv2.bitwise_not(labeled_as_other_wall))
-                    if hole_wall.any():
-                        max_fill_area = max(200, DEFAULT_HOLE_FILL_FRAC * image_area)
-                        _dk = max(15, int(0.008 * max(width, height)))
-                        near_object_wall = cv2.dilate(labeled_as_other_wall, np.ones((_dk, _dk), np.uint8))
-                        _any_occluder_raw = np.zeros_like(hole_wall)
-                        for _oseg in occluder_segments:
-                            _any_occluder_raw |= (segmentation_map == _oseg["segment_id"]).astype(np.uint8) * 255
-                        # A void gap immediately touching/inside an occluder's
-                        # silhouette is that object's own fuzzy, unlabeled edge
-                        # — EoMT rarely labels 100% of an object's pixels right
-                        # to its true boundary — not a genuine small gap in the
-                        # wall itself. `_any_occluder_raw` alone (exact label
-                        # match) never overlaps this halo by construction, so
-                        # it fell through to the small-hole-fill branch below
-                        # and got painted solid wall, with its removal resting
-                        # entirely on BiRefNet's later per-object cut. Verified:
-                        # when that BiRefNet detection comes back degenerate/
-                        # empty for a small or ambiguous crop, nothing ever
-                        # undoes the fill, leaving a solid wall island sitting
-                        # inside the object. Dilating catches the halo so it's
-                        # deferred to fg_combined (BiRefNet's precise cut, or —
-                        # if that also finds nothing — simply left unfilled)
-                        # instead of blindly trusted to wall.
-                        _any_occluder_dilated = cv2.dilate(_any_occluder_raw, np.ones((_dk, _dk), np.uint8))
-                        num_hw, labels_hw, stats_hw, _ = cv2.connectedComponentsWithStats(hole_wall, connectivity=8)
-                        hole_wall_capped = np.zeros_like(hole_wall)
-                        for _hwi in range(1, num_hw):
-                            comp_mask = (labels_hw == _hwi)
-                            # A component pixel that's neither EoMT's own wall
-                            # label, nor any other labeled object, nor a known
-                            # occluder is truly unexplained — void, not a
-                            # member of segments_info at all. A LARGE
-                            # truly-void chunk means EoMT never recognized
-                            # whatever is actually there — a real, unlabeled
-                            # piece of furniture (verified: a dark wood
-                            # dresser EoMT never labeled as anything).
-                            # Checked FIRST, before any branch below —
-                            # verified this exact case reaches connected-
-                            # components as ONE blob merging the dresser's
-                            # void together with a vase's own (already
-                            # correctly-excluded) pixels sitting on top of
-                            # it, since they're physically touching in the
-                            # image; that merge made the component visible to
-                            # the occluder_labeled_wall branch below, which
-                            # has no size limit at all and blindly filled the
-                            # WHOLE merged blob — including the unrelated
-                            # void — as wall. A blob this size is never a
-                            # genuine small hole/halo regardless of which
-                            # object it happens to touch, so it's excluded up
-                            # front rather than patched per-branch. Leaving it
-                            # unfilled (not even deferred to fg_combined,
-                            # which nothing will ever resolve for an object
-                            # with no label to find a candidate under) is the
-                            # safe side: at worst a real small wall gap goes
-                            # unpainted, never furniture painted as wall.
-                            truly_void = np.logical_and(
-                                np.logical_and(comp_mask, ~of_bool),
-                                ~np.logical_or(labeled_as_other_wall > 0, occluder_labeled_wall > 0)
-                            )
-                            if int(np.count_nonzero(truly_void)) > max_fill_area:
-                                continue
-                            if np.logical_and(comp_mask, occluder_labeled_wall > 0).any():
-                                hole_wall_capped[comp_mask] = 255
-                            elif np.logical_and(comp_mask, _any_occluder_dilated > 0).any():
-                                fg_combined[comp_mask] = 255
-                            elif (stats_hw[_hwi, cv2.CC_STAT_AREA] <= max_fill_area
-                                  and not np.logical_and(comp_mask, near_object_wall > 0).any()):
-                                hole_wall_capped[comp_mask] = 255
-                            else:
-                                # Same fix as the curtain path: reached when
-                                # the component is large, or small but
-                                # touching another labeled object's (pillow,
-                                # bed, furniture — anything in
-                                # labeled_as_other_wall, not just
-                                # occluder-type) dilated halo — that halo is
-                                # the object's own fuzzy edge, not a genuine
-                                # wall gap. near_object is now ALWAYS
-                                # deferred, no size-cap escape, so it's only
-                                # painted if BiRefNet elsewhere confirms it as
-                                # real wall, never blindly trusted by area.
-                                own_wall_part = np.logical_and(comp_mask, of_bool)
-                                near_object = np.logical_and(own_wall_part, near_object_wall > 0)
-                                far_from_object = np.logical_and(own_wall_part, near_object_wall == 0)
-                                hole_wall_capped[far_from_object] = 255
-                                fg_combined[near_object] = 255
-                                fg_combined[np.logical_and(comp_mask, ~of_bool)] = 255
-                        hole_wall = hole_wall_capped
-                    if hole_wall.any():
-                        mask_uint8 = cv2.bitwise_or(mask_uint8, hole_wall)
-
-                    wall_candidates = find_occluder_candidates(
-                        segmentation_map, segments_info, id2label,
-                        segment_id, BIREFNET_RECHECK_LABELS, bbox,
-                        region_mask=_wall_region_tol,
-                    )
-                    print("wall candidates:")
-                    for c in wall_candidates:
-                        print(c[0], c[2], c[3])
-                    if wall_candidates:
-                        load_birefnet_if_needed()
-                    for _oi, (
-                        _seg_id,
-                        _comp_label,
-                        _obj_bbox,
-                        _known_area,
-                        _raw_component_mask,
-                    ) in enumerate(wall_candidates):
-                            _cx1, _cy1, _cx2, _cy2, _fg_crop = get_cached_occluder_fg(
-                            _occluder_fg_cache,
-                            _seg_id,
-                            _comp_label,
-                            _raw_component_mask,
-                            _obj_bbox,
-                            _known_area,
-                            image,
-                            width,
-                            height
-                            )
-                            fg_combined[_cy1:_cy2, _cx1:_cx2] = np.maximum(
-                                fg_combined[_cy1:_cy2, _cx1:_cx2], _fg_crop
-                            )
-                            if DEBUG_SEG:
-                                try:
-                                    _hid = hotspot['image_hotspots_id']
-                                    cv2.imwrite(
-                                        os.path.join(_DEBUG_MASK_DIR,
-                                            f"birefnet_input_wall_{room_id}_{_hid}_{_oi}.png"),
-                                        cv2.cvtColor(np.array(image.crop((_cx1, _cy1, _cx2, _cy2))), cv2.COLOR_RGB2BGR)
-                                    )
-                                except Exception:
-                                    pass
-                    if fg_combined is not None and fg_combined.any():
-                        if DEBUG_SEG:
-                            try:
-                                _hid = hotspot['image_hotspots_id']
-                                cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
-                                    f"birefnet_cutout_wall_{room_id}_{_hid}.png"), fg_combined)
-                            except Exception:
-                                pass
-                        mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(fg_combined))
-                        _pre_kc_wall = mask_uint8.copy()
-                        mask_uint8 = keep_significant_components(mask_uint8, image_area)
-                        # Restore whatever keep_significant_components just
-                        # pruned as a "noise island", except pixels BiRefNet
-                        # itself claims as the object, and only within
-                        # _wall_region_tol (the wall's own pre-occlusion
-                        # reach) so this can't resurrect an object sitting
-                        # outside the wall's real territory.
-                        _dropped_wall = cv2.bitwise_and(_pre_kc_wall, cv2.bitwise_not(mask_uint8))
-                        _dropped_wall = cv2.bitwise_and(_dropped_wall, cv2.bitwise_not(fg_combined))
-                        _dropped_wall = cv2.bitwise_and(_dropped_wall, _wall_region_tol)
-                        mask_uint8 = cv2.bitwise_or(mask_uint8, _dropped_wall)
-                        # Hole-reveal and the re-cut against the later guided-
-                        # filter edge pass both happen once, shared with the
-                        # curtain path, further down — see _birefnet_occluder_mask.
-                    # Fail closed on any wall_candidate BiRefNet did not actually
-                    # carve out. Runs OUTSIDE the fg_combined.any() guard above,
-                    # because the worst case is precisely fg_combined coming back
-                    # empty — then the guarded block never executes and every
-                    # filled object stays painted.
-                    mask_uint8, _rev_occ = revert_unconfirmed_occluders(
-                        mask_uint8, wall_candidates, fg_combined, label="wall")
-                    reverted_occluders = cv2.bitwise_or(reverted_occluders, _rev_occ)
-                except Exception as _we:
-                    print(f"⚠ [WARN] BiRefNet wall step failed ({_we}); skipping.")
-
-            # Curtain hole completion via BiRefNet:
-            # 1. Fill the full curtain bbox (excluding structural gaps like window/wall).
-            # 2. Crop the image to the curtain panel and run BiRefNet → it treats the
-            #    curtain fabric as background and vase/branches as salient foreground.
-            # 3. Subtract the BiRefNet foreground from the filled curtain mask.
-            fg_full = None
-            if seg_class == "curtain":
-                try:
-                    x1, y1, x2, y2 = bbox
-                    # Step 1: fill curtain gaps inside the bbox.
-                    # Exclude any EoMT-labeled non-curtain segment EXCEPT known
-                    # foreground occluders (lamp, vase, plant…) — those sit IN FRONT
-                    # of the curtain and EoMT often bleeds their label onto adjacent
-                    # curtain fabric. We include those pixels so the fill recovers the
-                    # curtain fabric behind them; BiRefNet subtracts the actual object.
-                    # Everything else (wall, floor, pillow, bed, sofa, headboard…) is
-                    # excluded so the fill never bleeds below the curtain hem.
-                    # Within a curtain bbox, EoMT often labels curtain fabric as
-                    # "window/windowpane" because it can see the window behind.
-                    # Include these too so the fill recovers that curtain coverage
-                    # (window/windowpane need no BiRefNet re-detection, so they're
-                    # not part of BIREFNET_RECHECK_LABELS itself).
-                    _OCCLUDER_LABELS = BIREFNET_RECHECK_LABELS | {"window", "windowpane"}
-                    # A flat, width-independent cutoff line here (an earlier
-                    # attempt: curtain's own max-y + a fixed buffer, applied
-                    # uniformly across the whole bbox) doesn't follow any real
-                    # object's contour — it cuts some pillows too high and
-                    # others not enough depending on where they sit relative
-                    # to that one global row. The connected-component size
-                    # cap below is what actually guards against void bleed
-                    # (a pillow/headboard being filled in as curtain); no
-                    # separate flat cap is needed on top of it.
-                    bbox_fill = np.zeros((height, width), np.uint8)
-                    bbox_fill[y1:y2 + 1, x1:x2 + 1] = 255
-                    labeled_as_other = np.zeros((height, width), np.uint8)
-                    occluder_labeled = np.zeros((height, width), np.uint8)
-                    for _seg in segments_info:
-                        if _seg["id"] == segment_id:
-                            continue
-                        _lbl = get_label_from_id(id2label, _seg["label_id"])
-                        if not label_matches(_lbl, _OCCLUDER_LABELS):
-                            labeled_as_other[segmentation_map == _seg["id"]] = 255
-                        elif label_matches(_lbl, BIREFNET_RECHECK_LABELS):
-                            occluder_labeled[segmentation_map == _seg["id"]] = 255
-                    fg_full = np.zeros((height, width), np.uint8)
-                    hole = cv2.bitwise_and(bbox_fill, cv2.bitwise_not(mask_uint8))
-                    hole = cv2.bitwise_and(hole, cv2.bitwise_not(labeled_as_other))
-                    if hole.any():
-                        # A hole here is either a genuine small labeling gap in
-                        # the curtain fabric (recoverable — e.g. behind sparse
-                        # branches), a large VOID region where EoMT failed to
-                        # confidently classify a real object (a pillow, a
-                        # headboard) as anything at all, OR a labeled occluder
-                        # (lamp, vase, plant…) that Step 1 deliberately treats
-                        # as fillable so Step 2's BiRefNet can cut its precise
-                        # shape back out. Void pixels are NOT tracked in
-                        # labeled_as_other — void isn't a member of
-                        # segments_info, it's the absence of one — so without
-                        # a cap, a whole unlabeled pillow silently gets filled
-                        # in as "curtain" and painted with texture. But that
-                        # same size cap must NOT apply to a component that
-                        # touches an occluder-labeled segment: a real lamp or
-                        # vase is routinely bigger than the cap, and capping
-                        # it here would exclude it from the fill entirely —
-                        # leaving it (and any void pixels merged into the same
-                        # connected blob) permanently excluded, well beyond
-                        # BiRefNet's own precise shape, since it never gets a
-                        # chance to be filled-then-precisely-cut in Step 2.
-                        max_fill_area = max(200, DEFAULT_HOLE_FILL_FRAC * image_area)
-                        # Size alone can't tell "EoMT mislabeled a real object
-                        # as curtain" apart from "this is just a big stretch
-                        # of genuine curtain visible behind sparse leaves" —
-                        # both look like a large of_bool sub-region. Only
-                        # proximity to a real, known object (labeled_as_other)
-                        # tells them apart: a mislabel happens right at that
-                        # object's boundary, genuine fabric doesn't. Only
-                        # of_bool pixels near such an object go through the
-                        # size cap; of_bool pixels far from any go through
-                        # regardless of size (same fix as the wall path).
-                        _dk = max(15, int(0.008 * max(width, height)))
-                        near_object_curtain = cv2.dilate(labeled_as_other, np.ones((_dk, _dk), np.uint8))
-                        # Same fix as the wall path: a void gap immediately
-                        # touching/inside an occluder's silhouette is that
-                        # object's own fuzzy, unlabeled edge, not a genuine
-                        # small gap in the curtain fabric. `occluder_labeled`
-                        # alone (exact label match) never overlaps this halo
-                        # by construction, so it fell through to the
-                        # small-hole-fill branch below and got painted solid
-                        # curtain, with its removal resting entirely on
-                        # BiRefNet's later per-object cut (fg_full). Deferring
-                        # the halo to fg_full instead means it's either
-                        # precisely cut by BiRefNet or — if that also finds
-                        # nothing — simply left unfilled, instead of blindly
-                        # trusted to curtain.
-                        _occluder_labeled_dilated = cv2.dilate(occluder_labeled, np.ones((_dk, _dk), np.uint8))
-                        num_hole, labels_hole, stats_hole, _ = cv2.connectedComponentsWithStats(hole, connectivity=8)
-                        hole_capped = np.zeros_like(hole)
-                        for _hi in range(1, num_hole):
-                            comp_mask = (labels_hole == _hi)
-                            if np.logical_and(comp_mask, occluder_labeled > 0).any():
-                                hole_capped[comp_mask] = 255
-                            elif np.logical_and(comp_mask, _occluder_labeled_dilated > 0).any():
-                                fg_full[comp_mask] = 255
-                            elif (stats_hole[_hi, cv2.CC_STAT_AREA] <= max_fill_area
-                                  and not np.logical_and(comp_mask, near_object_curtain > 0).any()):
-                                hole_capped[comp_mask] = 255
-                            else:
-                                # Reached only when the component is either
-                                # large, or small but touching another
-                                # labeled object's (e.g. pillow, bed,
-                                # furniture — anything in labeled_as_other,
-                                # not just occluder-type) dilated halo. That
-                                # halo is the object's own fuzzy, unlabeled
-                                # edge, not a genuine curtain gap — verified:
-                                # a pillow's boundary halo was small enough to
-                                # pass the old area-only cap and got painted
-                                # solid curtain right up to the pillow's edge,
-                                # with no BiRefNet mechanism (pillows aren't
-                                # occluder-type) to ever cut it back out.
-                                # near_object is now ALWAYS deferred — no
-                                # size-cap escape — so it only gets painted
-                                # if BiRefNet elsewhere calls it real curtain,
-                                # never blindly trusted by area alone.
-                                own_curtain_part = np.logical_and(comp_mask, of_bool)
-                                near_object = np.logical_and(own_curtain_part, near_object_curtain > 0)
-                                far_from_object = np.logical_and(own_curtain_part, near_object_curtain == 0)
-                                hole_capped[far_from_object] = 255
-                                fg_full[near_object] = 255
-                                fg_full[np.logical_and(comp_mask, ~of_bool)] = 255
-                        hole = hole_capped
-                    if hole.any():
-                        mask_uint8 = cv2.bitwise_or(mask_uint8, hole)
-
-                    # Step 2: BiRefNet PER individual foreground occluder — crop
-                    # tightly around each object's OWN full shape, not the whole
-                    # curtain panel. A thin twig/vase is a tiny fraction of the full
-                    # curtain bbox, which reads as "no salient object" to BiRefNet
-                    # (verified: raw logits all background over the full-panel crop);
-                    # cropped tightly around just that object, the same model
-                    # detects it reliably (mirrors the per-occluder wall path above).
-                    # Same shared candidate discovery + cached detection as the wall
-                    # path, so an object already handled for the wall (or another
-                    # curtain whose bbox happens to overlap this one) is reused here
-                    # instead of re-run.
-                    #
-                    # Candidates are restricted to BIREFNET_RECHECK_LABELS — i.e.
-                    # exactly the set Step 1 filled back in (window/windowpane
-                    # excluded, since those need no re-detection). Furniture
-                    # (bed/table/pillow/…) was never excluded from labeled_as_other,
-                    # so it's already handled by the plain hard-subtract without
-                    # costing a BiRefNet call.
-                    fg_object_bboxes = find_occluder_candidates(
-                        segmentation_map, segments_info, id2label,
-                        segment_id, BIREFNET_RECHECK_LABELS, bbox,
-                    )
-
-                    # fg_full already carries any void blobs confirmed as real
-                    # unlabeled objects above; merge the labeled-occluder
-                    # detections into it rather than overwriting.
-                    if fg_object_bboxes:
-                        load_birefnet_if_needed()
-                        for _oi, (_seg_id, _comp_label, _obj_bbox, _known_area, _raw_component_mask) in enumerate(fg_object_bboxes):
-                            cx1, cy1, cx2, cy2, fg_crop = get_cached_occluder_fg(
-                                _occluder_fg_cache, _seg_id, _comp_label, _raw_component_mask,  _obj_bbox,
-                                _known_area, image, width, height,
-                            )
-                            fg_full[cy1:cy2, cx1:cx2] = np.maximum(fg_full[cy1:cy2, cx1:cx2], fg_crop)
-                            if DEBUG_SEG:
-                                try:
-                                    hotspot_id = hotspot['image_hotspots_id']
-                                    cv2.imwrite(
-                                        os.path.join(_DEBUG_MASK_DIR,
-                                            f"birefnet_input_{seg_class}_{room_id}_{hotspot_id}_{_oi}.png"),
-                                        cv2.cvtColor(np.array(image.crop((cx1, cy1, cx2, cy2))), cv2.COLOR_RGB2BGR)
-                                    )
-                                except Exception:
-                                    pass
-                        fg_full = cv2.bitwise_and(fg_full, cv2.bitwise_not(labeled_as_other))
-                        if DEBUG_SEG:
-                            try:
-                                hotspot_id = hotspot['image_hotspots_id']
-                                cv2.imwrite(
-                                    os.path.join(_DEBUG_MASK_DIR,
-                                        f"birefnet_cutout_{seg_class}_{room_id}_{hotspot_id}.png"),
-                                    fg_full
-                                )
-                            except Exception:
-                                pass
-                        mask_uint8 = cv2.bitwise_and(
-                            mask_uint8, cv2.bitwise_not(fg_full)
-                        )
-                        # Fail closed on any occluder BiRefNet did not carve out —
-                        # this is what stops flower#24 keeping curtain texture.
-                        mask_uint8, _rev_occ = revert_unconfirmed_occluders(
-                            mask_uint8, fg_object_bboxes, fg_full, label="curtain")
-                        reverted_occluders = cv2.bitwise_or(reverted_occluders, _rev_occ)
-                except Exception as _be:
-                    print(f"⚠ [WARN] BiRefNet curtain refinement failed ({_be}); skipping.")
-
-            if DEBUG_SEG and seg_class in ("wall", "curtain"):
-                try:
-                    cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
-                        f"after_birefnet_{seg_class}_{room_id}_{hotspot['image_hotspots_id']}.png"), mask_uint8)
-                except Exception:
-                    pass
-
-            # Final edge pass: snap boundary to actual image edges after all
-            # subtractions — OF segment boundaries are pixel-grid rough, this
-            # smooths them onto real colour transitions in the photo.
-            mask_uint8 = refine_mask_edges(mask_uint8, image_cv)
-            # A revealed occluder hole is by construction a small island fully
-            # enclosed by the occluder — exactly the shape the speckle prune at the
-            # end of this block would otherwise discard. Track every reveal so it
-            # can be exempted.
-            revealed_holes = np.zeros((height, width), np.uint8)
-            _birefnet_occluder_mask = fg_full if seg_class == "curtain" else fg_combined
-            if _birefnet_occluder_mask is not None:
-                # The guided-filter snap above follows color contrast; where
-                # an occluder's color is close to the surface's own (a brown
-                # branch against tan/beige curtain fabric, a pale lamp pole
-                # against a light wall — verified on both: BiRefNet's own
-                # cutout was precise, but the edge pass alone widened it by
-                # up to 7x beyond the true shape there), it bleeds the
-                # boundary wider than the object actually is. Re-apply the
-                # already-precise BiRefNet cut — on WHICHEVER surface this
-                # is — so low-contrast objects don't end up with a blurrier
-                # boundary than high-contrast ones.
-                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(_birefnet_occluder_mask))
-                # A detected occluder can have a genuine physical opening cut
-                # through it (verified: this vase's decorative ring) that lets
-                # the surface behind show through. Re-check for it here, AFTER
-                # the guided-filter pass above — that pass can itself blur or
-                # shrink a small revealed-hole island, so recomputing last
-                # (rather than earlier, before a step that can undo it) is what
-                # makes it actually survive to the saved mask.
-                revealed_holes = reveal_occluder_holes(_birefnet_occluder_mask, pre_occluder_mask)
-                mask_uint8 = cv2.bitwise_or(mask_uint8, revealed_holes)
-            # Post-refinement cleanup for wall: strip any OTHER labeled
-            # segment (window, windowpane, pillow, bed, headboard…) the
-            # guided-filter edge pass just above may have bled into. This
-            # mirrors the curtain-only cleanup below, closing the same gap
-            # for wall — verified: a decorative branch crossing in front of
-            # a window, with BiRefNet's own cutout not 100% covering its
-            # thinnest twigs, left small gaps where the guided filter (which
-            # only follows color contrast, oblivious to WHY a pixel was
-            # excluded) smeared wallpaper texture back across the window's
-            # own already-correctly-excluded segment. Unlike curtain, window/
-            # windowpane is NOT kept here — a window is a genuinely separate
-            # surface from wall, never an intentional fill-then-cut occluder
-            # the way a lamp/vase/plant is.
-            if seg_class == "wall":
-                for _seg in segments_info:
-                    if _seg["id"] == segment_id:
-                        continue
-                    _lbl = get_label_from_id(id2label, _seg["label_id"])
-                    if not label_matches(_lbl, BIREFNET_RECHECK_LABELS):
-                        mask_uint8[segmentation_map == _seg["id"]] = 0
-
-            # Post-refinement cleanup for curtains only: strip non-occluder
-            # segments the guided filter may have bled into (pillow, wall, etc.).
-            # Occluder labels (lamp, vase, plant) are kept — their pixels were
-            # intentionally included in the fill so BiRefNet can handle them.
-            if seg_class == "curtain":
-                _OCC_POST = {
-                    "lamp", "floor lamp", "table lamp", "light", "chandelier",
-                    "vase", "plant", "potted plant", "tree", "flower", "branch",
-                    "sculpture", "statue", "figurine", "candle", "candlestick",
-                    "stand", "tripod",
-                    "window", "windowpane",
-                }
-                for _seg in segments_info:
-                    if _seg["id"] == segment_id:
-                        continue
-                    _lbl = get_label_from_id(id2label, _seg["label_id"])
-                    if not label_matches(_lbl, _OCC_POST):
-                        mask_uint8[segmentation_map == _seg["id"]] = 0
-
-            if seg_class == "curtain" and fg_full is not None:
-                # Second safety net, curtain-only: the _OCC_POST cleanup just
-                # above zeroes pixels by raw EoMT segment id and doesn't know
-                # about the hole reveal that already ran earlier — if a hole
-                # happens to overlap one of those "other" segments, this
-                # would silently undo it. Re-apply once more, truly last.
-                _rev_again = reveal_occluder_holes(fg_full, pre_occluder_mask)
-                mask_uint8 = cv2.bitwise_or(mask_uint8, _rev_again)
-                revealed_holes = cv2.bitwise_or(revealed_holes, _rev_again)
-
-            # Generalise the fail-closed rule to EVERY recheck-labeled segment the
-            # mask overlaps, not just those that became BiRefNet candidates.
-            # find_occluder_candidates needs a >=100px overlap with the surface's
-            # dilated region, so an object the surface only partly bleeds onto is
-            # never a candidate and never gets reverted — and the cleanup loops
-            # above deliberately keep these labels. Measured on room d56138d4 with
-            # the per-candidate revert already in place: the wall still covered 63%
-            # of the pelmet box and 41% of the lamp/flowers box.
-            if seg_class in ("wall", "curtain"):
-                _bn = fg_full if seg_class == "curtain" else fg_combined
-                for _seg in segments_info:
-                    if _seg["id"] == segment_id:
-                        continue
-                    _lbl = get_label_from_id(id2label, _seg["label_id"])
-                    if not label_matches(_lbl, BIREFNET_RECHECK_LABELS):
-                        continue
-                    _sm = (segmentation_map == _seg["id"])
-                    _known = int(np.count_nonzero(_sm))
-                    if _known <= 0 or not np.logical_and(_sm, mask_uint8 > 127).any():
-                        continue
-                    _claimed = (int(np.count_nonzero(np.logical_and(_sm, _bn > 127)))
-                                if _bn is not None else 0)
-                    if _claimed / float(_known) < OCCLUDER_CONFIRM_FRAC:
-                        reverted_occluders[_sm] = 255
-            # A revealed see-through gap must never be undone by the sweep above.
-            if revealed_holes.any():
-                reverted_occluders = cv2.bitwise_and(
-                    reverted_occluders, cv2.bitwise_not(revealed_holes))
-
-            # Re-apply the fail-closed reverts: the guided filter above follows
-            # colour contrast only, and both cleanup loops deliberately leave
-            # recheck labels alone, so either can grow the surface back over an
-            # object whose fill was already rejected.
-            if reverted_occluders.any():
-                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(reverted_occluders))
-
-            # Impose straightness on ARCHITECTURAL boundaries only, and take the
-            # staircase off object silhouettes. The masks are already locally
-            # smooth (0.63px wobble at a 12px scale) but 84% of the median wall
-            # perimeter is long runs that are near-straight without being straight
-            # — see utils/mask_geometry.
-            #
-            # Straightening must be gated on WHAT LIES ACROSS the boundary, because
-            # a gently curved arc has excellent chord support: without this gate a
-            # decorative tree collapsed into a diamond and an oval mirror's top
-            # arc flattened. Anything not in STRAIGHTEN_AGAINST_LABELS blocks
-            # straightening in its neighbourhood, as do the BiRefNet cutouts and
-            # occluder silhouettes (they mark objects EoMT left unlabeled).
-            _straighten_zone = np.zeros((height, width), np.uint8)
-            if seg_class in STRAIGHTEN_SURFACE_CLASSES:
-                _blockers = np.zeros((height, width), np.uint8)
-                for _seg in segments_info:
-                    if _seg["id"] == segment_id:
-                        continue
-                    _lbl = get_label_from_id(id2label, _seg["label_id"])
-                    if not label_matches(_lbl, STRAIGHTEN_AGAINST_LABELS):
-                        _blockers[segmentation_map == _seg["id"]] = 255
-                for _extra in (fg_combined, fg_full, occluder_union,
-                               occluder_dilated, reverted_occluders):
-                    if _extra is not None:
-                        _blockers = cv2.bitwise_or(_blockers, _extra)
-                _zk = max(3, int(0.006 * max(width, height)))
-                _straighten_zone = cv2.bitwise_not(
-                    cv2.dilate(_blockers, np.ones((_zk, _zk), np.uint8)))
-            # A curtain gets an all-zero zone: detail smoothing, no straightening.
-            mask_uint8 = regularize_mask(mask_uint8, straighten_zone=_straighten_zone)
-
-            # Final speckle filter. postprocess_mask's keep_significant_components
-            # runs before the hole fills, the _dropped_wall restore and two
-            # guided-filter passes, so sub-threshold islands routinely survive into
-            # the saved mask (one measured wall mask kept 395/87/46/13px components
-            # against its own 786px threshold). Threshold here is deliberately 5x
-            # looser than that pass so it cannot undo the _dropped_wall restore.
-            #
-            # Anything touching a fine occluder cut is exempt: the wall slivers
-            # between a plant's twigs are legitimate sub-threshold components, and
-            # dropping them is what merged BiRefNet's per-twig cut into a blob.
-            _fine = revealed_holes.copy()
-            for _extra in (fg_combined, fg_full, occluder_union, occluder_dilated):
-                if _extra is not None:
-                    _fine = cv2.bitwise_or(_fine, _extra)
-            if _fine.any():
-                _fk = max(3, int(0.004 * max(width, height)))
-                _fine = cv2.dilate(_fine, np.ones((_fk, _fk), np.uint8))
-            mask_uint8 = prune_speckles(mask_uint8, image_area, protect_zone=_fine)
+                    mask_uint8 = keep_significant_components(mask_uint8, image_area)
         except Exception as e:
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8
