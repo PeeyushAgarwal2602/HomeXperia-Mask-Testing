@@ -67,9 +67,6 @@ OCCLUDER_OBJECTS = {
 # genuinely fine structure, where a blob silhouette is visibly wrong. Solid
 # furniture is deliberately excluded — a blob IS the correct silhouette for a
 # sofa, so a BiRefNet call there costs a crop of inference for no visible gain.
-# Measured on room 668b83dc: BiRefNet resolved a dried-branch arrangement down to
-# ~4.6px twigs (cutout perimeter/area 0.197) where OneFormer's own pixels and a
-# SAM box prompt both returned one amoeba-shaped blob.
 BIREFNET_OCCLUDER_LABELS = {
     "plant", "tree", "flower", "palm", "branch", "pot", "flowerpot", "vase",
     "lamp", "light", "floor lamp", "table lamp", "chandelier", "sconce",
@@ -117,17 +114,13 @@ def load_models_if_needed():
     from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
     from segment_anything_hq import sam_model_registry, SamPredictor # type:ignore
 
-    # Load OneFormer. Its processor resizes to shortest_edge 800 / longest_edge
-    # 1333 and the pixel decoder predicts masks at 1/4 stride, so mask cells land
-    # around 5px on a 1536px upload — roughly twice as fine per axis as the fixed
-    # 160x160 grid a 640px EoMT produces, which is why thin structure survives.
+    # Load OneFormer.
     processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
     segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
 
-    # Load SAM-HQ (ViT-B — keeps per-worker VRAM close to the previous stack,
-    # which matters because every gunicorn worker loads its own copy)
-    sam_checkpoint = os.getenv("SAM_HQ_CHECKPOINT", "sam_hq_vit_b.pth")
-    model_type = os.getenv("SAM_HQ_MODEL_TYPE", "vit_b")
+    # Load SAM-HQ (ViT-B)
+    sam_checkpoint = "sam_hq_vit_b.pth"
+    model_type = "vit_b"
     _orig_load = torch.load
     torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "map_location": device})
     try:
@@ -598,11 +591,27 @@ def build_occluder_union(predictor, occluder_segments, segmentation_map, image_b
 
     return union
 
-def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil,
-                                 id2label, room_id=None):
+def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil, id2label, room_id=None):
     """Crisp union of the THIN/SPARSE occluders only, via BiRefNet — no dilation.
 
-    This is the one thing subtracted from WALL. Two deliberate restrictions:
+    Returns (crisp_union, footprints): `footprints` is the list of RAW OneFormer
+    footprints of the components BiRefNet actually resolved.
+
+    The caller needs them because SUBTRACTING THE CRISP UNION ALONE IS A NO-OP.
+    OneFormer has already excluded the whole plant from the wall mask as one
+    coarse blob, so removing a thin twig silhouette from an already-missing region
+    changes nothing. Measured on rooms 4448f78f, c77a842c and f4eec840: 100% of
+    BiRefNet's cut pixels were ALREADY absent from the wall mask — the subtraction
+    altered 0% of its own area, so BiRefNet's precision never reached the render.
+
+    To make it visible the caller must FILL the coarse footprint back to wall and
+    THEN carve the crisp silhouette out of it. That fill is the entire mechanism by
+    which BiRefNet's quality becomes visible, and it is what the older EoMT
+    production pipeline was doing (through a bbox fill) when its leaf cutouts
+    looked right. Filling each occluder's OWN footprint instead of its bounding box
+    keeps the benefit without the bbox fill's habit of swallowing unrelated objects.
+
+    Two deliberate restrictions:
 
       * Only BIREFNET_OCCLUDER_LABELS classes. Solid furniture is already excluded
         from a wall mask by OneFormer's own labelling, so subtracting a SAM blob
@@ -619,16 +628,17 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
     """
     H, W = segmentation_map.shape[:2]
     if not occluder_segments:
-        return None
+        return None, []
 
     thin = [o for o in occluder_segments
             if label_matches(get_label_from_id(id2label, o["label_id"]), BIREFNET_OCCLUDER_LABELS)]
     if not thin:
         print("➡ [INFO] No thin/sparse occluders in this scene; wall keeps raw OneFormer pixels.")
-        return None
+        return None, []
 
     load_birefnet_if_needed()
     union = np.zeros((H, W), dtype=np.uint8)
+    footprints = []
     n_done = 0
     for occ in thin:
         seg_bool = (segmentation_map == occ["segment_id"])
@@ -651,6 +661,14 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
                 union = cv2.bitwise_or(union, raw)
                 continue
             union[cy1:cy2, cx1:cx2] = np.maximum(union[cy1:cy2, cx1:cx2], fg)
+            # Only offer the footprint for refilling when BiRefNet returned a
+            # silhouette genuinely TIGHTER than the coarse footprint. If it fell
+            # back to the raw pixels (its own sanity check) or came back empty,
+            # refilling would paint surface straight over the object — fail closed.
+            fg_in_fp = int(np.count_nonzero(cv2.bitwise_and(
+                fg, raw[cy1:cy2, cx1:cx2])))
+            if fg_in_fp > 0 and fg_in_fp < 0.92 * area:
+                footprints.append(raw)
             n_done += 1
             if DEBUG_SEG and room_id:
                 try:
@@ -660,9 +678,10 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
                 except Exception:
                     pass
 
-    print(f"➡ [INFO] BiRefNet refined {n_done} thin occluder component(s) "
+    print(f"➡ [INFO] BiRefNet refined {n_done} thin occluder component(s), "
+          f"{len(footprints)} tight enough to refill; "
           f"from {len(thin)} of {len(occluder_segments)} occluder segment(s)")
-    return union if union.any() else None
+    return (union if union.any() else None), footprints
 
 def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max_hole_frac=DEFAULT_HOLE_FILL_FRAC):
     """Shared cleanup: bridge small gaps, keep ALL significant components,
@@ -679,7 +698,7 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max
     return mask_uint8
 
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
-
+    
     load_models_if_needed() # Ensure models are loaded
 
     width, height = image.size
@@ -816,9 +835,9 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
         d = max(2, int(0.002 * max(width, height)))
         occluder_dilated = cv2.dilate(occluder_union, np.ones((d, d), np.uint8))
 
-    occluder_birefnet = None
+    occluder_birefnet, occluder_footprints = None, []
     try:
-        occluder_birefnet = build_occluder_union_birefnet(
+        occluder_birefnet, occluder_footprints = build_occluder_union_birefnet(
             occluder_segments, segmentation_map, image, id2label, room_id=room_id)
     except Exception as _be:
         print(f"⚠ [WARN] BiRefNet occluder pass failed ({_be}); wall keeps raw OneFormer pixels.")
@@ -870,6 +889,27 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 mask_uint8 = postprocess_mask(surface, image_cv, image_area,
                                               max_hole_frac=max_hole_frac, do_edge_refine=False)
                 if occluder_birefnet is not None:
+                    # FILL then CARVE. Subtracting the crisp silhouette on its own
+                    # is a measured no-op (100% of its pixels are already absent
+                    # from the wall), so first restore each resolved occluder's
+                    # coarse OneFormer footprint, then cut the precise silhouette
+                    # out of it. What survives is wall in the true gaps between
+                    # twigs and leaves — which is the whole point of BiRefNet.
+                    for _fp in occluder_footprints:
+                        # Only refill an occluder that is genuinely embedded in
+                        # THIS wall. A plant standing in front of a window shares
+                        # no border with the wall, and refilling it there would
+                        # paint wallpaper across the window between its leaves.
+                        _rk = max(3, int(0.006 * max(width, height)))
+                        _ring = cv2.bitwise_and(
+                            cv2.dilate(_fp, np.ones((_rk, _rk), np.uint8)),
+                            cv2.bitwise_not(_fp))
+                        _ring_px = int(np.count_nonzero(_ring))
+                        if _ring_px == 0:
+                            continue
+                        _on_wall = int(np.count_nonzero(cv2.bitwise_and(_ring, mask_uint8)))
+                        if _on_wall / float(_ring_px) >= 0.5:
+                            mask_uint8 = cv2.bitwise_or(mask_uint8, _fp)
                     mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_birefnet))
                     mask_uint8 = keep_significant_components(mask_uint8, image_area)
             else:
