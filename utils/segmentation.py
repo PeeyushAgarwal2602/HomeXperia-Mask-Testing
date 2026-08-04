@@ -695,6 +695,47 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
           f"from {len(thin)} of {len(occluder_segments)} occluder segment(s)")
     return (union if union.any() else None), footprints
 
+def find_enclosed_holes(mask_img):
+    """Just the fully-enclosed interior holes of mask_img — pixels that are 0 but
+    unreachable from the image border without crossing a 255 pixel."""
+    _, binary_mask = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
+    padded = cv2.copyMakeBorder(binary_mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    h, w = padded.shape[:2]
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    flood = padded.copy()
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    flood = flood[1:h - 1, 1:w - 1]
+    return cv2.bitwise_not(flood)
+
+def reveal_occluder_holes(occluder_mask, surface_extent_mask):
+    """Recover the SEE-THROUGH gaps inside an occluder's silhouette.
+
+    A rope loop, or the gap between two twigs, is an enclosed hole in the
+    occluder's shape through which the surface behind is genuinely visible. These
+    are most of what makes the production masks look crisp: measured on the same
+    room, prod carries 30 and 54 enclosed holes where ours carried 4 and 3.
+
+    Only revealed when the hole's horizontal span falls almost entirely within
+    columns the surface actually reaches — otherwise a sparse object straddling
+    the surface's edge would have gaps opening onto a window revealed as surface.
+    surface_extent_mask must be the surface's own mask from BEFORE any occluder
+    subtraction.
+    """
+    holes = find_enclosed_holes(occluder_mask)
+    if not holes.any():
+        return holes
+    col_reach = surface_extent_mask.any(axis=0)
+    num, labels = cv2.connectedComponents(holes)
+    revealed = np.zeros_like(holes)
+    for i in range(1, num):
+        blob = labels == i
+        if int(blob.sum()) < 20:
+            continue
+        cols = np.unique(np.where(blob)[1])
+        if col_reach[cols].mean() >= 0.9:
+            revealed[blob] = 255
+    return revealed
+
 def apply_occluder_cutout(mask_uint8, footprints, crisp_union, image_area, ring_frac=0.006):
     """FILL each resolved occluder's coarse footprint, THEN carve its crisp
     silhouette. Used by both wall and curtain.
@@ -957,6 +998,7 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 # Using ">= 0" here would treat void as another object and eat every
                 # mask's unlabelled fringe.
                 mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(other_of))
+                pre_occluder_mask = mask_uint8.copy()
                 mask_uint8, _nf = apply_occluder_cutout(
                     mask_uint8, occluder_footprints, occluder_birefnet, image_area)
                 if _nf:
@@ -983,6 +1025,7 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 # it. Measured over the v2.1 rooms: 87k px of curtain mask was
                 # sitting on wall / window / floor / rug masks in 9 of 10 rooms.
                 mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(other_of))
+                pre_occluder_mask = mask_uint8.copy()
 
                 # Occluders WITHOUT a precise silhouette still get the dilated SAM
                 # blob, which closes inter-leaf gaps so curtain texture cannot bleed
@@ -997,6 +1040,31 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                     mask_uint8, occluder_footprints, occluder_birefnet, image_area)
                 if _nf:
                     print(f"   [CUTOUT] {seg_class}: refilled+carved {_nf} occluder footprint(s)")
+            # ---- Shared tail, matching the production pipeline's ordering ----
+            # 1. other_of above imposes OneFormer's RAW upsampled label grid on the
+            #    boundary, which is a pure horizontal/vertical staircase. Measured
+            #    against prod on the same rooms, skipping this step left our masks
+            #    blockier on every single one (axis-aligned boundary-step fraction
+            #    0.890/0.814/0.898 vs prod's 0.876/0.783/0.835). Snap back onto real
+            #    image edges to undo it — this is THE fix for the pixelated edges,
+            #    and the wall path previously had no edge refinement at all.
+            mask_uint8 = refine_mask_edges(mask_uint8, image_cv)
+
+            if occluder_birefnet is not None:
+                # 2. The guided filter above follows colour contrast only, so where
+                #    an occluder's colour is close to the surface's it re-thickens
+                #    the boundary the carve just made precise. Re-apply the crisp
+                #    cut so low-contrast objects are no blurrier than high-contrast
+                #    ones. This is what makes a final edge pass SAFE on the wall.
+                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_birefnet))
+                # 3. Recover the see-through gaps — rope loops, gaps between twigs.
+                #    Recomputed here, AFTER the edge pass, because that pass can
+                #    blur or erase a small revealed island.
+                try:
+                    mask_uint8 = cv2.bitwise_or(
+                        mask_uint8, reveal_occluder_holes(occluder_birefnet, pre_occluder_mask))
+                except Exception as _rh:
+                    print(f"⚠ [WARN] Hole reveal failed ({_rh}); skipping.")
         except Exception as e:
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8
