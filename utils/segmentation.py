@@ -89,8 +89,21 @@ ONEFORMER_EXTENT_CLASSES = {"wall", "floor", "curtain"}
 # Surfaces from which precise occluder silhouettes should be subtracted.
 OCCLUDER_SUBTRACT_CLASSES = {"curtain", "wall"}
 
-OCCLUDER_MIN_AREA = 0.0005     # ignore occluder segments below 0.05% of the image
+# Occluder segments are admitted on an ABSOLUTE pixel floor, not a fraction of the
+# image. A fraction scales the wrong way: 0.05% of a 3840x2063 upload is 3960 px, so a
+# whole dried-branch segment was dropped HERE — before build_occluder_union_birefnet
+# ever got the chance to split it into components — while the same branch in an
+# 894x894 upload (400 px threshold) sailed through. That is the "twigs getting
+# swallowed" complaint on 2bcd442b and 41384699: the branch was never an occluder
+# candidate at all, so no amount of BiRefNet quality downstream could recover it.
+# 100 px matches both the per-component floor in build_occluder_union_birefnet and the
+# production pipeline's own find_occluder_candidates threshold.
+OCCLUDER_MIN_PX = 100
 SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
+
+# Half-width, in MASK pixels, of the anti-aliased alpha ramp written into the saved
+# mask PNG — see antialias_mask_edge for why this exists and why it is a constant.
+MASK_FEATHER_PX = 2.5
 
 # Max enclosed-hole size to fill, as a fraction of the image area. Holes larger
 # than this are real objects sitting on/in the surface (a table on the floor, a
@@ -790,6 +803,50 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max
         mask_uint8 = refine_mask_edges(mask_uint8, image_bgr)
     return mask_uint8
 
+def antialias_mask_edge(mask_uint8, width=MASK_FEATHER_PX):
+    """Write the mask with an ANTI-ALIASED boundary instead of a hard 0/255 step.
+
+    This is the fix for the staircase ("pixelated") mask edges, and the artifact is
+    created at RENDER time, not here. Every renderer magnifies the mask with nearest
+    neighbour — utils/wall.py, utils/curtain.py, utils/floor.py, utils/rugs.py and
+    utils/wall_depth.py all do
+        cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    and then feed it to the blend as an alpha with only a 3x3 Gaussian on top. Masks
+    are saved at the UPLOAD resolution while the render canvas is always ~4500 px on
+    its long side (app.py upscale_image), so a mask boundary pixel is blown up into a
+    k*k block with k = 4500 / max(mask_w, mask_h). Measured over the v2.3 test rooms
+    that k ran from 1.17x (3840 px upload) to 5.03x (894 px upload), and the feedback
+    tracked it exactly: no pixelation complaint at 1.17x, "low strength, acceptable" at
+    1.59x, and a complaint on every room from 2.93x up. A hard binary edge simply
+    cannot survive a 5x nearest upscale, no matter how good the mask geometry is —
+    the worst-offending room's masks were the CLEANEST of the set.
+    Nothing downstream re-thresholds the alpha before blending, so a grayscale ramp in
+    the PNG reaches the blend intact and the magnified edge reads as a smooth gradient
+    rather than a row of blocks.
+
+    A SIGNED DISTANCE ramp, not a Gaussian blur. A blur sums contributions from both
+    walls of a narrow gap and fills it in: at sigma 1.5 a 3 px see-through gap between
+    twigs came back 69% closed, which would attack the exact thing the crisp cutouts
+    are for. The distance field has no such cross-talk — measured, a 3 px gap stays
+    fully open, a 3 px sliver of surface keeps full alpha, and because alpha crosses
+    0.5 exactly on the original boundary the >127 set is bit-identical to the binary
+    mask (IoU 1.0000), so every threshold-127 consumer downstream is untouched.
+
+    `width` is a constant in MASK pixels on purpose — it needs no knowledge of the
+    render size. The ramp is magnified by the same k as the staircase it hides, so the
+    ratio between them is scale-invariant and one value covers every upload size.
+    """
+    binary = (mask_uint8 > 127).astype(np.uint8)
+    if not binary.any() or binary.all():
+        return mask_uint8  # nothing to feather; also guards distanceTransform
+    # distanceTransform measures to the nearest zero pixel WITHIN the image, so a mask
+    # running off the frame keeps full alpha at the border instead of fading out.
+    d_in = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    d_out = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
+    sdf = d_in - d_out  # > 0 inside, < 0 outside, 0 on the boundary
+    alpha = np.clip(0.5 + sdf / (2.0 * float(width)), 0.0, 1.0)
+    return (alpha * 255.0 + 0.5).astype(np.uint8)
+
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
     
     load_models_if_needed() # Ensure models are loaded
@@ -833,7 +890,7 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
         seg_area_ratio = seg_count / float(image_area)
 
         # Collect occluders for precise subtraction later.
-        if label_matches(model_label, OCCLUDER_OBJECTS) and seg_area_ratio >= OCCLUDER_MIN_AREA:
+        if label_matches(model_label, OCCLUDER_OBJECTS) and seg_count >= OCCLUDER_MIN_PX:
             rows_o, cols_o = np.where(seg_bool)
             occluder_segments.append({
                 "segment_id": segment_id,
@@ -1029,7 +1086,20 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                     surface = refined
 
                 max_hole_frac = HOLE_FILL_FRAC.get(seg_class, DEFAULT_HOLE_FILL_FRAC)
-                mask_uint8 = postprocess_mask(surface, image_cv, image_area, max_hole_frac=max_hole_frac)
+                # do_edge_refine=False: the guided filter runs ONCE per mask, in the
+                # shared tail below. It used to run here too, so every non-wall class
+                # got two passes — and each pass roughens the boundary it is meant to
+                # clean, because it follows local colour contrast and a textured
+                # wall/fabric makes the 0.5 crossing wander per-pixel. Measured on a
+                # geometrically perfect ellipse over a real textured guide: boundary
+                # wiggle 0.30px clean -> 0.52px after one pass -> 0.64px after two,
+                # with specks appearing at two. That doubling is what v2.3 introduced
+                # and why the pixelation read as a NEW global issue even though the
+                # renderer's nearest upscale had always been there. The late pass is
+                # the one worth keeping: it runs after other_of, so it is the pass
+                # that actually has the raw label staircase to undo.
+                mask_uint8 = postprocess_mask(surface, image_cv, image_area,
+                                              max_hole_frac=max_hole_frac, do_edge_refine=False)
 
                 # Hard-subtract every OTHER labelled segment — see the wall branch
                 # for why the sentinel is "!= 0". This is the fix for the global
@@ -1092,6 +1162,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
         except Exception as e:
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8
+
+        # Anti-alias the boundary LAST, after the except-fallback above, so the
+        # OneFormer-only fallback mask is written the same way as a fully refined one.
+        mask_uint8 = antialias_mask_edge(mask_uint8)
 
         mask_img = Image.fromarray(mask_uint8)
         mask_filename = f"mask_{room_id}_{hotspot['image_hotspots_id']}.png"
