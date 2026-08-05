@@ -707,7 +707,7 @@ def find_enclosed_holes(mask_img):
     flood = flood[1:h - 1, 1:w - 1]
     return cv2.bitwise_not(flood)
 
-def reveal_occluder_holes(occluder_mask, surface_extent_mask):
+def reveal_occluder_holes(occluder_mask, surface_extent_mask, min_hole_px=20):
     """Recover the SEE-THROUGH gaps inside an occluder's silhouette.
 
     A rope loop, or the gap between two twigs, is an enclosed hole in the
@@ -729,7 +729,14 @@ def reveal_occluder_holes(occluder_mask, surface_extent_mask):
     revealed = np.zeros_like(holes)
     for i in range(1, num):
         blob = labels == i
-        if int(blob.sum()) < 20:
+        # SIZE GATE. BiRefNet's silhouettes are fine enough that a hardcoded 20px
+        # floor let through a swarm of noise specks: measured over this run's wall
+        # and curtain masks, 179 + 101 tiny islands appeared where the previous
+        # build had ZERO, and the median small component was 12px with p75 at
+        # 135px. After the renderer's ~3.3x nearest upscale each of those paints a
+        # visible block, which reads as pixelated edges. Genuine see-through gaps
+        # (a rope loop, a gap between twigs) are far larger and survive this.
+        if int(blob.sum()) < min_hole_px:
             continue
         cols = np.unique(np.where(blob)[1])
         if col_reach[cols].mean() >= 0.9:
@@ -997,7 +1004,14 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 # and ids start at 1 — the opposite of EoMT (void -1, ids from 0).
                 # Using ">= 0" here would treat void as another object and eat every
                 # mask's unlabelled fringe.
-                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(other_of))
+                # NO other_of here, deliberately. It was added to fix CURTAIN bleed,
+                # which was measured; the wall never had a bleed complaint. What it
+                # DID cost the wall is edge quality: other_of is OneFormer's raw
+                # upsampled label map, whose boundary is a coarse axis-aligned
+                # staircase, and stamping it onto the wall took the mean boundary
+                # run from ~2px to 8.47px. segmentation_v2.1.py had no other_of on
+                # the wall and its edges were acceptable, so the wall goes back to
+                # raw OneFormer pixels exactly as it was there.
                 pre_occluder_mask = mask_uint8.copy()
                 mask_uint8, _nf = apply_occluder_cutout(
                     mask_uint8, occluder_footprints, occluder_birefnet, image_area)
@@ -1048,7 +1062,15 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             #    0.890/0.814/0.898 vs prod's 0.876/0.783/0.835). Snap back onto real
             #    image edges to undo it — this is THE fix for the pixelated edges,
             #    and the wall path previously had no edge refinement at all.
-            mask_uint8 = refine_mask_edges(mask_uint8, image_cv)
+            # Only the non-wall classes need this. They DO get other_of (that is
+            # the curtain-bleed fix) so their boundary carries the raw label
+            # staircase and has to be snapped back onto real image edges — that
+            # pass measurably improved the wall from 8.47 to 6.23 mean run when the
+            # wall still had other_of. With the wall now back on raw OneFormer
+            # pixels it has no staircase to undo, and v2.1 proved it looks right
+            # without any edge pass, so it is left alone.
+            if seg_class != "wall":
+                mask_uint8 = refine_mask_edges(mask_uint8, image_cv)
 
             if occluder_birefnet is not None:
                 # 2. The guided filter above follows colour contrast only, so where
@@ -1061,8 +1083,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 #    Recomputed here, AFTER the edge pass, because that pass can
                 #    blur or erase a small revealed island.
                 try:
+                    _min_hole = max(150, int(0.0002 * image_area))
                     mask_uint8 = cv2.bitwise_or(
-                        mask_uint8, reveal_occluder_holes(occluder_birefnet, pre_occluder_mask))
+                        mask_uint8, reveal_occluder_holes(
+                            occluder_birefnet, pre_occluder_mask, min_hole_px=_min_hole))
                 except Exception as _rh:
                     print(f"⚠ [WARN] Hole reveal failed ({_rh}); skipping.")
         except Exception as e:
