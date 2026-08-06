@@ -186,6 +186,15 @@ def get_metric_depth(image_cv2):
 BIREFNET_MODEL_ID = "ZhengPeng7/BiRefNet_lite"
 BIREFNET_INPUT_SIZE = 512  # do NOT raise: 1024 OOMs under multi-worker gunicorn
 
+# Contrast applied to BiRefNet's sigmoid before it is used as an alpha matte.
+# The raw sigmoid is a saliency score, not a calibrated alpha: left alone, a whole
+# ambiguous region can sit at 0.3-0.7 and turn a large patch of surface
+# semi-transparent. This gain keeps the soft band narrow (only p in
+# [0.5 - 0.5/gain, 0.5 + 0.5/gain] stays intermediate — at gain 4 that is
+# 0.375..0.625) so the silhouette is crisp with a genuinely anti-aliased edge,
+# instead of either a hard staircase or a mushy blob.
+BIREFNET_MATTE_GAIN = 4.0
+
 def load_birefnet_if_needed():
     global _birefnet
     if _birefnet is not None:
@@ -199,7 +208,16 @@ def load_birefnet_if_needed():
     print("✅ [INFO] BiRefNet-lite loaded.")
 
 def birefnet_fg_mask(image_pil, out_hw):
-    """Run BiRefNet on a PIL crop; return a uint8 fg mask resized to out_hw (H, W)."""
+    """Run BiRefNet on a PIL crop; return a SOFT uint8 alpha matte resized to out_hw.
+
+    The sigmoid is kept as a matte rather than thresholded at 0.5. BiRefNet predicts a
+    genuinely sub-pixel silhouette — that is the whole reason it is in this pipeline —
+    and `(pred > 0.5) * 255` threw it away, so a leaf edge arrived as a hard staircase
+    on the 512-px inference grid. Worse, the old code thresholded and THEN resized with
+    INTER_LINEAR, so the intermediate values that did survive were interpolation of an
+    already-binarised mask: soft-looking, but carrying no more information than the
+    binary. Scaling the probability first keeps the real thing.
+    """
     import torchvision.transforms.functional as TF
     s = BIREFNET_INPUT_SIZE
     img = image_pil.convert("RGB").resize((s, s))
@@ -209,8 +227,9 @@ def birefnet_fg_mask(image_pil, out_hw):
     with torch.no_grad():
         preds = _birefnet(t)
     pred = preds[-1].sigmoid().cpu().squeeze().numpy()
-    mask = (pred > 0.5).astype(np.uint8) * 255
-    return cv2.resize(mask, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_LINEAR)
+    alpha = np.clip((pred - 0.5) * BIREFNET_MATTE_GAIN + 0.5, 0.0, 1.0)
+    soft = (alpha * 255.0 + 0.5).astype(np.uint8)
+    return cv2.resize(soft, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_LINEAR)
 
 def birefnet_detect_object(image, raw_component_mask, obj_bbox, known_area, width, height):
     """BiRefNet foreground detection for one object, with expand-and-retry.
@@ -236,7 +255,12 @@ def birefnet_detect_object(image, raw_component_mask, obj_bbox, known_area, widt
         if first_box is None:
             first_box = (cx1, cy1, cx2, cy2)
         fg_crop = birefnet_fg_mask(image.crop((cx1, cy1, cx2, cy2)), (cy2 - cy1, cx2 - cx1))
-        area = int(np.count_nonzero(fg_crop))
+        # fg_crop is a SOFT matte. Every gate below is a decision about "is the object
+        # here", so each one reads the >127 core, never the raw non-zero count — the
+        # anti-aliased skirt around a thin twig is many pixels wide and would inflate
+        # `area` enough to trip the degenerate test on a perfectly good detection.
+        fg_bin = fg_crop > 127
+        area = int(fg_bin.sum())
         # A detection covering nearly the whole crop is a degenerate result — the
         # model found nothing distinctly salient and defaulted to "everything".
         # Never trust it, not even as a fallback: blanking a whole rectangle of
@@ -246,8 +270,8 @@ def birefnet_detect_object(image, raw_component_mask, obj_bbox, known_area, widt
         if area > best_area and not degenerate:
             best_fg_crop, best_box, best_area = fg_crop, (cx1, cy1, cx2, cy2), area
         touches_edge = area > 0 and (
-            fg_crop[0, :].any() or fg_crop[-1, :].any() or
-            fg_crop[:, 0].any() or fg_crop[:, -1].any()
+            fg_bin[0, :].any() or fg_bin[-1, :].any() or
+            fg_bin[:, 0].any() or fg_bin[:, -1].any()
         )
         full_frame = (cx1 == 0 and cy1 == 0 and cx2 == width and cy2 == height)
         if not degenerate and ((area >= min_good_area and not touches_edge) or full_frame):
@@ -270,7 +294,7 @@ def birefnet_detect_object(image, raw_component_mask, obj_bbox, known_area, widt
     #      silhouette always does.
     cx1, cy1, cx2, cy2 = best_box
     area_ratio = best_area / max(1, known_area)
-    fys, fxs = np.where(best_fg_crop > 0)
+    fys, fxs = np.where(best_fg_crop > 127)
     known_h, known_w = max(1, oy2 - oy1), max(1, ox2 - ox1)
     if len(fys) == 0:
         extent_frac = 0.0
@@ -421,12 +445,14 @@ def keep_significant_components(mask_img, image_area, frac_image=0.0005, min_abs
         return np.zeros_like(mask_img)
     thresh = max(min_abs, frac_image * float(image_area))
     largest_label = int(np.argmax(areas)) + 1
-    out = np.zeros_like(mask_img)
-    out[labels == largest_label] = 255
+    keep = (labels == largest_label)
     for i, a in enumerate(areas, start=1):
         if a >= thresh:
-            out[labels == i] = 255
-    return out
+            keep |= (labels == i)
+    # Copy the ORIGINAL values through rather than stamping 255. Identical for a
+    # binary input, but this now also runs on masks carrying BiRefNet's soft alpha,
+    # and stamping would flatten that matte back to a hard edge.
+    return np.where(keep, mask_img, 0).astype(mask_img.dtype)
 
 def _guided_filter(I, p, radius, eps):
     ksize = (2 * radius + 1, 2 * radius + 1)
@@ -679,7 +705,7 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
                     image_pil, raw, obj_bbox, area, W, H)
             except Exception as e:
                 print(f"⚠ [WARN] BiRefNet occluder detect failed ({e}); using OneFormer pixels.")
-                union = cv2.bitwise_or(union, raw)
+                union = np.maximum(union, raw)
                 continue
             union[cy1:cy2, cx1:cx2] = np.maximum(union[cy1:cy2, cx1:cx2], fg)
             # Offer the footprint for refilling unless the detection is so weak
@@ -691,7 +717,9 @@ def build_occluder_union_birefnet(occluder_segments, segmentation_map, image_pil
             # An earlier "< 0.92 * area" test had this backwards and rejected 8 of
             # 12 perfectly good refills across the v2.1 rooms, which is why the
             # lamp in 16239afa kept its ~6px border.
-            fg_in_fp = int(np.count_nonzero(cv2.bitwise_and(fg, raw[cy1:cy2, cx1:cx2])))
+            # >127 core on both sides — fg is a soft matte now, so bitwise_and would
+            # count anti-aliased skirt pixels as detection.
+            fg_in_fp = int(np.count_nonzero((fg > 127) & (raw[cy1:cy2, cx1:cx2] > 127)))
             if fg_in_fp >= max(50, int(0.25 * area)):
                 footprints.append(raw)
             n_done += 1
@@ -756,7 +784,73 @@ def reveal_occluder_holes(occluder_mask, surface_extent_mask, min_hole_px=20):
             revealed[blob] = 255
     return revealed
 
-def apply_occluder_cutout(mask_uint8, footprints, crisp_union, image_area, ring_frac=0.006):
+VOID_HALO_DIST_FRAC = 0.015  # how far a void halo may reach from its occluder
+VOID_HALO_MAX_GROWTH = 2.0   # halo may not exceed this multiple of the footprint's area
+
+def grow_footprint_into_void(fp, mask_uint8, void_bool,
+                             dist_frac=VOID_HALO_DIST_FRAC,
+                             max_growth=VOID_HALO_MAX_GROWTH):
+    """Grow an occluder's footprint outward into the adjacent VOID halo.
+
+    This is the single biggest reason the production pipeline's cutouts look crisper
+    than ours. OneFormer will not label the fuzzy region around a vase or a dried
+    branch — it labels a thin confident core and drops the rest to void. Measured on
+    room 6a717a84 against prod's fd3cf46c (same photo, 3840x2063): 52% of the curtain
+    prod keeps and we delete is covered by NO occluder mask at all. It is that
+    unlabelled envelope — 8px thick at the median, 28px at p90, 54px at worst.
+
+    Prod recovers it by filling the surface's whole bounding box and then carving the
+    BiRefNet silhouette out of it. That works, but a bbox fill also swallows anything
+    else inside the box, which is exactly why v2.1 replaced it with a footprint fill.
+    The footprint, though, is the LABELLED core — smaller than the halo that needs
+    recovering — so a footprint fill can never undo damage extending beyond it.
+
+    The test for "is this halo mine" is ENCLOSURE by (footprint + this surface): flood
+    from outside and keep the void that cannot be reached. That single test does all the
+    work, because every other labelled segment is left out of the flood barrier and so
+    counts as outside — a void shell ringed by curtain is unreachable and qualifies,
+    while a shell opening onto a window or a bed is reachable through it and does not.
+    It is prod's flood fill, scoped to the occluder's neighbourhood instead of the whole
+    bounding box, which is precisely the bbox fill's swallowing risk removed.
+
+    Two bounds on top:
+      * distance — the halo may only reach dist_frac of the long side from the
+        footprint. A halo is a thin shell; an unlabelled dresser abutting the plant is
+        not, and this stops the fill running down its whole face.
+      * growth — the halo may not exceed max_growth times the footprint's own area. A
+        shell around an object is comparable to the object; anything far larger is not
+        a shell, so the whole growth is abandoned rather than half-applied.
+    """
+    if void_bool is None or not void_bool.any():
+        return fp
+    h, w = fp.shape[:2]
+    d = max(3, int(dist_frac * max(h, w)))
+    ys, xs = np.where(fp > 127)
+    if len(ys) == 0:
+        return fp
+    # Work inside the footprint's neighbourhood only — nothing beyond bbox+d is
+    # reachable anyway, and a full-frame dilate per footprint costs ~0.5s at
+    # 3840x2063. The +2 margin keeps the flood's outside ring inside the crop.
+    m = d + 2
+    y0, y1 = max(0, int(ys.min()) - m), min(h, int(ys.max()) + m + 1)
+    x0, x1 = max(0, int(xs.min()) - m), min(w, int(xs.max()) + m + 1)
+    fp_c = fp[y0:y1, x0:x1]
+    near = cv2.dilate(fp_c, np.ones((2 * d + 1, 2 * d + 1), np.uint8)) > 0
+
+    # Barrier = the occluder plus this surface. Everything else — other segments and
+    # any void that escapes — is "outside".
+    barrier = ((fp_c > 127) | (mask_uint8[y0:y1, x0:x1] > 127)).astype(np.uint8) * 255
+    trapped = find_enclosed_holes(barrier) > 0
+    fill = trapped & void_bool[y0:y1, x0:x1] & near & ~(fp_c > 127)
+    n_fill = int(fill.sum())
+    if n_fill == 0 or n_fill > max_growth * max(1, int((fp_c > 127).sum())):
+        return fp
+    out = fp.copy()
+    out[y0:y1, x0:x1][fill] = 255
+    return out
+
+def apply_occluder_cutout(mask_uint8, footprints, crisp_union, image_area, ring_frac=0.006,
+                          void_bool=None):
     """FILL each resolved occluder's coarse footprint, THEN carve its crisp
     silhouette. Used by both wall and curtain.
 
@@ -778,16 +872,28 @@ def apply_occluder_cutout(mask_uint8, footprints, crisp_union, image_area, ring_
     rk = max(3, int(ring_frac * max(h, w)))
     ker = np.ones((rk, rk), np.uint8)
     n_filled = 0
+    n_halo = 0
+    halo_union = np.zeros_like(mask_uint8)
     for fp in footprints or []:
         ring = cv2.bitwise_and(cv2.dilate(fp, ker), cv2.bitwise_not(fp))
         ring_px = int(np.count_nonzero(ring))
         if ring_px == 0:
             continue
+        # The decision to refill still rests on the ORIGINAL footprint's ring — that
+        # gate is what keeps a plant standing in front of a window from painting
+        # wallpaper between its leaves. Only WHAT gets refilled grows.
         if int(np.count_nonzero(cv2.bitwise_and(ring, mask_uint8))) / float(ring_px) >= 0.5:
-            mask_uint8 = cv2.bitwise_or(mask_uint8, fp)
+            fill = grow_footprint_into_void(fp, mask_uint8, void_bool)
+            if int(np.count_nonzero(fill)) > int(np.count_nonzero(fp)):
+                n_halo += 1
+                halo_union = np.maximum(halo_union, cv2.bitwise_and(fill, cv2.bitwise_not(fp)))
+            mask_uint8 = np.maximum(mask_uint8, fill)
             n_filled += 1
-    mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(crisp_union))
-    return keep_significant_components(mask_uint8, image_area), n_filled
+    # Soft carve: crisp_union is BiRefNet's alpha matte, so the surface keeps
+    # (1 - occluder_alpha). bitwise_and/bitwise_not would quantise that back to a
+    # hard edge and re-introduce the staircase this matte exists to avoid.
+    mask_uint8 = np.minimum(mask_uint8, 255 - crisp_union)
+    return keep_significant_components(mask_uint8, image_area), (n_filled, n_halo), halo_union
 
 def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True, max_hole_frac=DEFAULT_HOLE_FILL_FRAC):
     """Shared cleanup: bridge small gaps, keep ALL significant components,
@@ -845,7 +951,26 @@ def antialias_mask_edge(mask_uint8, width=MASK_FEATHER_PX):
     d_out = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
     sdf = d_in - d_out  # > 0 inside, < 0 outside, 0 on the boundary
     alpha = np.clip(0.5 + sdf / (2.0 * float(width)), 0.0, 1.0)
-    return (alpha * 255.0 + 0.5).astype(np.uint8)
+    ramp = (alpha * 255.0 + 0.5).astype(np.uint8)
+    # Pass an already-soft matte straight through. Where the incoming mask carries
+    # genuinely intermediate values it is BiRefNet's alpha on an occluder silhouette —
+    # real, image-derived sub-pixel detail — and this purely geometric ramp knows
+    # nothing that could improve it. It must be `where`, not a min/max blend: a matte
+    # value below 127 reads as background to the binary above, so the ramp drives it to
+    # 0 and any blend would erase the very detail this is meant to protect.
+    is_soft = (mask_uint8 > 4) & (mask_uint8 < 251)
+    return np.where(is_soft, mask_uint8, ramp).astype(np.uint8)
+
+def _dump_halo_debug(halo, room_id, seg_class, hotspot_id):
+    """Save the void halo this surface recovered, so a run can be measured after the
+    fact — the halo fill is the change most likely to need its bounds retuned."""
+    if not (DEBUG_SEG and room_id) or halo is None or not halo.any():
+        return
+    try:
+        cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
+                    f"halo_{seg_class}_{room_id}_{hotspot_id}.png"), halo)
+    except Exception:
+        pass
 
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
     
@@ -992,17 +1117,40 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     except Exception as _be:
         print(f"⚠ [WARN] BiRefNet occluder pass failed ({_be}); wall keeps raw OneFormer pixels.")
 
-    # Wherever BiRefNet gave a precise silhouette, drop that object out of the
-    # FATTENED blob — otherwise the dilated version would immediately re-thicken
-    # the boundary the crisp carve just made precise, which is the ~6px border.
+    # Wherever BiRefNet resolved an object, BiRefNet OWNS that object's boundary:
+    # drop the SAM blob for it entirely, by whole connected component.
+    #
+    # This used to subtract only a dilate(footprint, 0.006*long_side) neighbourhood
+    # from the blob, and that is nowhere near enough. Measured on room 6a717a84
+    # (3840x2063, so the old kernel was 23px): the dilated SAM union is 4.44x the area
+    # of the BiRefNet union, and in the occluder neighbourhood our resulting hole
+    # matched the SAM blob (IoU 0.641) BETTER than it matched BiRefNet (0.611) — i.e.
+    # the blob, not the matte, was still defining the silhouette. Prod's equivalent
+    # hole matches its own BiRefNet cutout at IoU 0.713. Our hole came out 1.30x the
+    # size of prod's. That gap IS the blobbiness.
+    #
+    # Dropping the whole component is the right unit: a SAM blob component and the
+    # footprint inside it are the same physical object, so no part of that blob has
+    # any business trimming the surface once a precise matte exists for it. Blobs with
+    # no resolved footprint (solid furniture) are untouched and still close inter-leaf
+    # gaps for the curtain, which is what they were added for.
     if occluder_dilated is not None and occluder_footprints:
         _fp_all = np.zeros_like(occluder_dilated)
         for _fp in occluder_footprints:
-            _fp_all = cv2.bitwise_or(_fp_all, _fp)
-        _dk2 = max(3, int(0.006 * max(width, height)))
-        occluder_dilated = cv2.bitwise_and(
-            occluder_dilated,
-            cv2.bitwise_not(cv2.dilate(_fp_all, np.ones((_dk2, _dk2), np.uint8))))
+            _fp_all = np.maximum(_fp_all, _fp)
+        _num_b, _lab_b = cv2.connectedComponents((occluder_dilated > 127).astype(np.uint8))
+        _kept = np.zeros_like(occluder_dilated)
+        _n_owned = 0
+        for _bi in range(1, _num_b):
+            _comp = (_lab_b == _bi)
+            if (_comp & (_fp_all > 127)).any():
+                _n_owned += 1
+                continue
+            _kept[_comp] = 255
+        occluder_dilated = _kept
+        if _n_owned:
+            print(f"➡ [INFO] BiRefNet owns {_n_owned} of {_num_b - 1} SAM occluder blob(s); "
+                  f"those blobs no longer trim any surface.")
 
     if DEBUG_SEG:
         for _nm, _m in (("occluders", occluder_union),
@@ -1014,6 +1162,11 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 cv2.imwrite(os.path.join(_DEBUG_MASK_DIR, f"{_nm}_{room_id}.png"), _m)
             except Exception:
                 pass
+
+    # VOID is what OneFormer declined to label at all — sentinel 0, ids from 1 (the
+    # opposite of EoMT's -1/from-0). It is the raw material for the halo fill in
+    # grow_footprint_into_void: the unlabelled envelope around a vase or a branch.
+    void_bool = (segmentation_map == 0)
 
     # -> Generate the final mask for each hotspot.
     for hotspot in hotspots:
@@ -1070,10 +1223,13 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 # the wall and its edges were acceptable, so the wall goes back to
                 # raw OneFormer pixels exactly as it was there.
                 pre_occluder_mask = mask_uint8.copy()
-                mask_uint8, _nf = apply_occluder_cutout(
-                    mask_uint8, occluder_footprints, occluder_birefnet, image_area)
+                mask_uint8, (_nf, _nh), _halo = apply_occluder_cutout(
+                    mask_uint8, occluder_footprints, occluder_birefnet, image_area,
+                    void_bool=void_bool)
                 if _nf:
-                    print(f"   [CUTOUT] wall: refilled+carved {_nf} occluder footprint(s)")
+                    print(f"   [CUTOUT] wall: refilled+carved {_nf} occluder footprint(s), "
+                          f"{_nh} grown into their void halo ({int(np.count_nonzero(_halo))} px)")
+                _dump_halo_debug(_halo, room_id, seg_class, hotspot['image_hotspots_id'])
             else:
                 refined = refine_with_sam(sam_predictor, of_bool, bbox, neg_points, (height, width))
 
@@ -1120,10 +1276,13 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
 
                 # Occluders WITH one get fill-and-carve, so the boundary is
                 # BiRefNet's silhouette rather than a fattened blob.
-                mask_uint8, _nf = apply_occluder_cutout(
-                    mask_uint8, occluder_footprints, occluder_birefnet, image_area)
+                mask_uint8, (_nf, _nh), _halo = apply_occluder_cutout(
+                    mask_uint8, occluder_footprints, occluder_birefnet, image_area,
+                    void_bool=void_bool)
                 if _nf:
-                    print(f"   [CUTOUT] {seg_class}: refilled+carved {_nf} occluder footprint(s)")
+                    print(f"   [CUTOUT] {seg_class}: refilled+carved {_nf} occluder footprint(s), "
+                          f"{_nh} grown into their void halo ({int(np.count_nonzero(_halo))} px)")
+                _dump_halo_debug(_halo, room_id, seg_class, hotspot['image_hotspots_id'])
             # ---- Shared tail, matching the production pipeline's ordering ----
             # 1. other_of above imposes OneFormer's RAW upsampled label grid on the
             #    boundary, which is a pure horizontal/vertical staircase. Measured
@@ -1148,13 +1307,18 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 #    the boundary the carve just made precise. Re-apply the crisp
                 #    cut so low-contrast objects are no blurrier than high-contrast
                 #    ones. This is what makes a final edge pass SAFE on the wall.
-                mask_uint8 = cv2.bitwise_and(mask_uint8, cv2.bitwise_not(occluder_birefnet))
+                #    Soft (min against 255-alpha), not bitwise: refine_mask_edges above
+                #    re-binarised the mask, so this is also the step that puts
+                #    BiRefNet's matte back on the occluder boundary for the non-wall
+                #    classes. Doing it with bitwise_and would throw the matte away
+                #    again and leave the silhouette hard-edged.
+                mask_uint8 = np.minimum(mask_uint8, 255 - occluder_birefnet)
                 # 3. Recover the see-through gaps — rope loops, gaps between twigs.
                 #    Recomputed here, AFTER the edge pass, because that pass can
                 #    blur or erase a small revealed island.
                 try:
                     _min_hole = max(150, int(0.0002 * image_area))
-                    mask_uint8 = cv2.bitwise_or(
+                    mask_uint8 = np.maximum(
                         mask_uint8, reveal_occluder_holes(
                             occluder_birefnet, pre_occluder_mask, min_hole_px=_min_hole))
                 except Exception as _rh:
