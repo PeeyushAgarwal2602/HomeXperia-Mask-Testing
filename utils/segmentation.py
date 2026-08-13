@@ -113,19 +113,35 @@ SMALL_OBJECT_MIN_AREA = 0.005  # hotspot small-object filter (0.5% of the image)
 # 1-2px fringe of surface texture on its edge, LOWER this rather than dilating.
 BIREFNET_CUT_LEVEL = 115
 
-# A VOID hole (OneFormer labelled nothing) larger than this share of the image is not
-# model uncertainty, it is an unlabelled real object. Halo clusters measured on room
-# 6a717a84 (3840x2063) topped out at ~7k px = 0.09% of frame, so 0.5% clears every
-# genuine halo with a wide margin while still refusing to swallow furniture.
-VOID_FILL_MAX_FRAC = 0.005
-# ...but a void hole that TOUCHES an occluder is that object's own unlabelled fringe,
-# and a large object legitimately has a large fringe, so it gets a far more generous
-# ceiling. Contact with an occluder is strong evidence about what the void IS, which a
-# frame-relative area threshold alone can never provide. (Prod's equivalent branch had
-# no ceiling at all here; this keeps one so a dresser fused to a plant still cannot get
-# through — fused, their areas sum and blow past even this cap, and the conservative
-# failure is to under-fill rather than to paint wallpaper over furniture.)
-VOID_HALO_MAX_FRAC = 0.04
+# --- what a void pocket must prove before any surface may claim it ---
+#
+# v2.7 gated void purely on AREA and it failed both ways. Measured on that run:
+#   * 153,463 px of room 39a4c8ae ended up in BOTH the wall and the curtain mask (30.7%
+#     of the smaller one) because area says nothing about WHOSE void a pocket is;
+#   * a 383,287 px ottoman in room c9ffb25f was painted as wall, because it happened to
+#     touch a sofa and the old "touching an occluder means it is that object's fringe"
+#     rule handed it a 4%-of-frame allowance.
+# Area was simply the wrong question. These three ask better ones.
+
+# 1. OWNERSHIP. Of the pocket's ring that belongs to a confidently-labelled SURFACE, at
+#    least this share must be THIS surface. A void fringe lying along a wall/curtain seam
+#    is ringed ~50/50, so neither side reaches the bar and neither claims it — which is
+#    correct, because a seam belongs to nobody. Occluders and void in the ring abstain.
+VOID_OWNERSHIP_MIN = 0.65
+
+# 2. THINNESS. A halo is a SHELL around an object; furniture is solid. The pocket's
+#    inradius (max of its distance transform) separates them cleanly and, unlike area,
+#    does not depend on how much of the frame the object happens to fill. Measured halos
+#    ran 8px thick at the median and 54px at worst on a 3840px frame — inradius 4-27px —
+#    while the c9ffb25f ottoman's inradius was ~85px on a 1536px frame. As a fraction of
+#    the long side that is 0.007 vs 0.055, so 0.015 sits between them with margin.
+VOID_MAX_INRADIUS_FRAC = 0.015
+
+# 3. SIZE FLOOR. v2.7 filled 94-300 pockets per surface. Those were not halos; they were
+#    the speckle of unlabelled pixels OneFormer leaves along every segment seam. Nothing
+#    that small is worth recovering, and filling hundreds of them is what produced the
+#    stippled seams.
+VOID_MIN_POCKET_PX = 100
 
 # Validation gate: reject the heal if the final mask outgrew OneFormer's own surface by
 # more than this. A complete fill is a powerful operation and needs a guard — prod's
@@ -755,8 +771,9 @@ def occluders_in_front_of(occluder_union, surface_uint8, labelled_bool=None,
     return out
 
 def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_map,
-                 occluder_seg_ids, image_area, void_fill_max_frac=VOID_FILL_MAX_FRAC,
-                 void_halo_max_frac=VOID_HALO_MAX_FRAC):
+                 occluder_seg_ids, image_area, ownership_min=VOID_OWNERSHIP_MIN,
+                 max_inradius_frac=VOID_MAX_INRADIUS_FRAC,
+                 min_pocket_px=VOID_MIN_POCKET_PX):
     """FILL ONCE: complete interior fill of the surface, protecting real openings.
 
     The occluders in front of the surface are part of the flood BARRIER while the extent
@@ -768,17 +785,16 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
     it is an enclosed hole of the barrier, so a single fill recovers all of it. No
     footprint refill, no halo growth, no distance caps.
 
-    A hole is only filled when we know what it is:
-      * VOID touching an occluder -> that object's unlabelled fringe. Fill, generously.
-      * VOID touching nothing      -> an unlabelled real object. Fill only if small.
-      * an OCCLUDER segment    -> we cut it precisely one step later. Fill.
-      * anything else          -> LEFT EXCLUDED.
-    That last branch is the safe default and it is what protects windows, doors and
-    arches without needing a label whitelist: an arch shows the next room's floor and
-    wall, so the hole's dominant label is a different surface class and it survives
-    untouched. It also protects objects this pipeline does not model at all — a mirror
-    or a painting is not in OCCLUDER_OBJECTS, so nothing would ever cut it back out, and
-    a size-based rule would happily paint wallpaper straight over it.
+    A pocket must clear three independent gates before this surface may claim it — see
+    the constants above for the measurements behind each. It must be big enough to be a
+    halo at all, it must be OWNED by this surface rather than shared with another, and it
+    must be THIN enough to be a shell rather than a solid object.
+
+    Windows, doors and arches need no gate of their own: they are labelled, so they are
+    part of the barrier and never become holes in the first place. That also protects
+    objects this pipeline does not model — a mirror or a painting is not in
+    OCCLUDER_OBJECTS, so nothing would ever cut it back out of a surface that swallowed
+    it, and it is safest that the fill can never reach it.
     """
     # The flood BARRIER is everything OneFormer was confident about: this surface, the
     # occluders in front of it, and all other labelled territory. Only VOID is floodable,
@@ -795,32 +811,54 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
     # The EXTENT, though, is only ever surface + occluder. Structural territory bounds
     # the fill; it is never claimed by it.
     out = np.maximum(surface_uint8, occ_front_uint8)
-    st = {"filled": 0, "kept_structural": 0, "kept_big_void": 0}
+    st = {"filled": 0, "speck": 0, "contested": 0, "too_thick": 0, "unrecognised": 0}
     if not holes.any():
         return out, st
-    num, labels, cc_stats, _ = cv2.connectedComponentsWithStats(
-        (holes > 0).astype(np.uint8), connectivity=8)
-    max_void = max(200.0, void_fill_max_frac * float(image_area))
-    max_halo = max(max_void, void_halo_max_frac * float(image_area))
-    # dilate by one so a hole sitting flush against the occluder registers as touching
-    occ_near = cv2.dilate(occ_front_uint8, np.ones((3, 3), np.uint8)) > 0
+    holes_bin = (holes > 0).astype(np.uint8)
+    num, labels, cc_stats, _ = cv2.connectedComponentsWithStats(holes_bin, connectivity=8)
+    # One distance transform covers every pocket: dt[p] is p's distance to the nearest
+    # non-hole pixel, so a component's maximum is that component's inradius.
+    dt = cv2.distanceTransform(holes_bin, cv2.DIST_L2, 5)
+    h, w = surface_uint8.shape[:2]
+    max_inradius = max(4.0, max_inradius_frac * float(max(h, w)))
+    surf_bool = surface_uint8 > 127
+    rival_bool = structural_uint8 > 127
+    k3 = np.ones((3, 3), np.uint8)
     for i in range(1, num):
-        comp = (labels == i)
         area = int(cc_stats[i, cv2.CC_STAT_AREA])
-        vals, counts = np.unique(segmentation_map[comp], return_counts=True)
+        if area < min_pocket_px:
+            st["speck"] += 1
+            continue
+        # Work inside the pocket's own bounding box. With several hundred pockets per
+        # surface, full-frame masking per component would dominate the runtime.
+        x0 = max(0, int(cc_stats[i, cv2.CC_STAT_LEFT]) - 2)
+        y0 = max(0, int(cc_stats[i, cv2.CC_STAT_TOP]) - 2)
+        x1 = min(w, x0 + int(cc_stats[i, cv2.CC_STAT_WIDTH]) + 4)
+        y1 = min(h, y0 + int(cc_stats[i, cv2.CC_STAT_HEIGHT]) + 4)
+        sub = labels[y0:y1, x0:x1] == i
+
+        # THINNESS — a shell, or a solid object?
+        if float(dt[y0:y1, x0:x1][sub].max()) > max_inradius:
+            st["too_thick"] += 1
+            continue
+
+        # OWNERSHIP — among the surfaces bordering this pocket, is this one dominant?
+        ring = cv2.dilate(sub.astype(np.uint8), k3).astype(bool) & ~sub
+        own = int((ring & surf_bool[y0:y1, x0:x1]).sum())
+        rival = int((ring & rival_bool[y0:y1, x0:x1]).sum())
+        if own + rival == 0 or own / float(own + rival) < ownership_min:
+            st["contested"] += 1
+            continue
+
+        # Label safety: only void, or an occluder that gets cut anyway, may be taken.
+        vals, counts = np.unique(segmentation_map[y0:y1, x0:x1][sub], return_counts=True)
         dominant = int(vals[int(np.argmax(counts))])
-        if dominant == 0:                       # VOID — OneFormer labelled nothing
-            cap = max_halo if bool((comp & occ_near).any()) else max_void
-            if area <= cap:
-                out[comp] = 255
-                st["filled"] += 1
-            else:
-                st["kept_big_void"] += 1
-        elif dominant in occluder_seg_ids:      # will be cut precisely in one step
-            out[comp] = 255
-            st["filled"] += 1
-        else:                                   # opening / other surface / unknown object
-            st["kept_structural"] += 1
+        if dominant != 0 and dominant not in occluder_seg_ids:
+            st["unrecognised"] += 1
+            continue
+
+        out[y0:y1, x0:x1][sub] = 255
+        st["filled"] += 1
     return out, st
 
 def refine_boundary_scoped(mask_uint8, image_bgr, occluder_union, guard_frac=0.004):
@@ -1155,10 +1193,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 healed, _hst = heal_surface(surface, occ_front, structural_uint8,
                                             segmentation_map, _occ_ids, image_area)
                 healed = cv2.bitwise_and(healed, cv2.bitwise_not(structural_uint8))
-                if _hst["filled"] or _hst["kept_big_void"] or _hst["kept_structural"]:
+                if any(_hst.values()):
                     print(f"   [HEAL] {seg_class}: filled {_hst['filled']} void pocket(s); "
-                          f"refused {_hst['kept_big_void']} too-large-to-trust"
-                          + (f" + {_hst['kept_structural']} unrecognised" if _hst['kept_structural'] else ""))
+                          f"refused {_hst['contested']} contested / {_hst['too_thick']} too-thick / "
+                          f"{_hst['unrecognised']} unrecognised / {_hst['speck']} specks")
             else:
                 healed = surface
 
