@@ -108,7 +108,7 @@ def _detect_floor_quad(room_img, floor_mask=None):
 
     left_segs, right_segs = [], []
     if lines_full is not None:
-        for x1_, y1_, x2_, y2_ in lines_full[:, 0]:
+        for x1_, y1_, x2_, y2_ in np.asarray(lines_full).reshape(-1, 4):
             y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
             dx  = float(x2_ - x1_); dy = float(y2g - y1g)
             if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
@@ -192,7 +192,7 @@ def _detect_floor_quad(room_img, floor_mask=None):
         if lines_ref is not None:
             floor_top_y_init = floor_top_y
             best_score, best_y = 0.0, floor_top_y
-            for x1_, y1_, x2_, y2_ in lines_ref[:, 0]:
+            for x1_, y1_, x2_, y2_ in np.asarray(lines_ref).reshape(-1, 4):
                 if abs(y2_ - y1_) > 14: continue
                 length = math.hypot(x2_ - x1_, y2_ - y1_)
                 gy   = int((y1_ + y2_) * 0.5) + ref_lo

@@ -146,8 +146,7 @@ def _detect_wall_quad(mask_gray, debug_img=None):
         lines = cv2.HoughLinesP(clean_boundary, 1, np.pi / 180, threshold=20, minLineLength=max(40, w//8), maxLineGap=20)
         top_lines, bot_lines = [], []
         if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
+            for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
                 if (max(y1, y2) <= 3 or min(y1, y2) >= H - 4 or max(x1, x2) <= 3 or min(x1, x2) >= W - 4): continue
                 dx, dy = float(x2 - x1), float(y2 - y1)
                 if abs(dx) < 1e-3: continue

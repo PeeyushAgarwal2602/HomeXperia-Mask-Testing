@@ -7,6 +7,8 @@ import torch
 import numpy as np
 from PIL import Image
 
+from utils.mask_geometry import regularize_mask
+
 # Global variables to hold the models in memory
 _models_loaded = False
 processor = None
@@ -156,6 +158,27 @@ MAX_HEAL_GROWTH_FRAC = 0.5
 # v2.6 feather was 2.5 MASK px, which became 25 render px at a 5x upscale.
 RENDER_MAX_DIM = 4500
 AA_RENDER_PX = 1.5
+
+# --- boundary straightening (utils/mask_geometry) ---
+# The rasteriser removed the per-pixel staircase (boundary noise 0.32-0.71px at 4500
+# across every v2.7 room) but the boundary SHAPE still wanders 4-12px, straight from
+# OneFormer's label grid, and at 4500px that reads as a wavy or stepped edge. No filter
+# fixes it: the masks are already locally smooth, they are just globally not straight.
+# Measured at native resolution over the v2.5 masks, regularize_mask cuts boundary
+# complexity 43% (17.0 -> 9.7 DP vertices per 1000px of perimeter) for -0.6% mean area.
+STRAIGHTEN_CLASSES = {"wall", "curtain"}
+
+# Where straightening is PERMITTED. A surface meeting a ceiling, floor, another wall or
+# a window/door frame shares a genuinely straight architectural edge. A surface meeting a
+# mirror, a plant, a lamp or curtain fabric is bounded by that object's organic contour,
+# and straightening there polygonises it — measured in mask_geometry's own notes, an oval
+# mirror's arc and a torn soffit edge are numerically indistinguishable, so only the
+# labels can tell them apart. Curtain is deliberately absent: it is fabric, not geometry.
+ARCHITECTURAL_NEIGHBOUR_LABELS = {
+    "wall", "ceiling", "floor", "flooring", "window", "windowpane",
+    "door", "doorframe", "column", "pillar", "stairs", "stairway", "staircase", "step",
+}
+STRAIGHTEN_REACH_FRAC = 0.015
 
 # Classes that still get the guided-filter edge snap. Kept deliberately until the new
 # boundary generation is verified to produce clean edges unaided; the wall has been
@@ -924,6 +947,33 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True,
         mask_uint8 = refine_mask_edges(mask_uint8, image_bgr)
     return mask_uint8
 
+def build_straighten_zone(arch_all_uint8, own_bool, occluder_union, shape,
+                          reach_frac=STRAIGHTEN_REACH_FRAC):
+    """Mark where this surface's boundary may be straightened.
+
+    The surface's OWN pixels are removed before the dilation, which is the whole trick:
+    "wall" is itself an architectural label, so dilating the architecture mask with the
+    surface still in it would cover the surface's entire boundary and permit
+    straightening everywhere — exactly what the zone exists to prevent. Other wall
+    segments stay in, because a wall/wall corner is a real straight edge.
+
+    Occluders are then removed, so no arc against a plant, lamp or piece of furniture can
+    be straightened however straight it happens to look. The frame border goes in because
+    a mask running off the edge of the photo is bounded by a straight line by definition.
+    """
+    H, W = shape[:2]
+    arch = arch_all_uint8.copy()
+    arch[own_bool] = 0
+    r = max(5, int(reach_frac * max(H, W)))
+    zone = cv2.dilate(arch, np.ones((2 * r + 1, 2 * r + 1), np.uint8))
+    b = max(3, int(0.004 * max(H, W)))
+    zone[:b, :] = 255; zone[-b:, :] = 255; zone[:, :b] = 255; zone[:, -b:] = 255
+    if occluder_union is not None:
+        k = max(3, int(0.01 * max(H, W)))
+        zone = cv2.bitwise_and(zone, cv2.bitwise_not(
+            cv2.dilate(occluder_union, np.ones((k, k), np.uint8))))
+    return zone
+
 def render_canvas_size(w, h, target=RENDER_MAX_DIM):
     """The canvas the renderers will actually composite on, so our resize is theirs.
 
@@ -1117,6 +1167,14 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     except Exception as _be:
         print(f"⚠ [WARN] Occluder pass failed ({_be}); surfaces keep raw OneFormer pixels.")
 
+    # Every architectural region in the scene, built once. Per surface, its own pixels
+    # come out before the zone is dilated — see build_straighten_zone.
+    arch_all = np.zeros((height, width), np.uint8)
+    for _seg in segments_info:
+        if label_matches(get_label_from_id(id2label, _seg["label_id"]),
+                         ARCHITECTURAL_NEIGHBOUR_LABELS):
+            arch_all[segmentation_map == _seg["id"]] = 255
+
     # Occluder territory as OneFormer labelled it — needed so the heal can tell an
     # occluder hole (fill, it gets cut precisely) from a structural one (leave alone).
     _occ_ids = {o["segment_id"] for o in occluder_segments}
@@ -1224,7 +1282,24 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
             mask_uint8 = of_uint8
 
-        # ---- 6. rasterise at render resolution, anti-aliased once, at the very end ----
+        # ---- 6. straighten the architectural runs ----
+        # At NATIVE resolution, before the rasteriser: this is geometry, and the
+        # tolerances are fractions of the long side that were tuned against native-size
+        # masks. Run after the cut so the occluder silhouettes exist to be protected.
+        if seg_class in STRAIGHTEN_CLASSES:
+            try:
+                _zone = build_straighten_zone(arch_all, of_bool, occluder_union,
+                                              mask_uint8.shape)
+                _before = int((mask_uint8 > 127).sum())
+                mask_uint8 = regularize_mask(mask_uint8, straighten_zone=_zone)
+                _after = int((mask_uint8 > 127).sum())
+                print(f"   [STRAIGHTEN] {seg_class}: area {_before} -> {_after} "
+                      f"({100.0 * (_after - _before) / max(1, _before):+.2f}%)")
+            except Exception as _sg:
+                print(f"⚠ [WARN] Straightening failed for {seg_class} ({_sg}); "
+                      f"keeping the unstraightened mask.")
+
+        # ---- 7. rasterise at render resolution, anti-aliased once, at the very end ----
         mask_uint8 = rasterise_at_render_res(mask_uint8)
 
         mask_img = Image.fromarray(mask_uint8)
