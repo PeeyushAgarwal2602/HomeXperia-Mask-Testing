@@ -1036,6 +1036,20 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     
     load_models_if_needed() # Ensure models are loaded
 
+    # --- Pre-segmentation downscaling ---
+    orig_width, orig_height = image.size
+    MAX_SEG_DIM = 1536 
+    scale_factor = 1.0
+    
+    if max(orig_width, orig_height) > MAX_SEG_DIM:
+        scale_factor = MAX_SEG_DIM / max(orig_width, orig_height)
+        new_w = int(orig_width * scale_factor)
+        new_h = int(orig_height * scale_factor)
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        print(f"➡ [INFO] Downscaled HD image for segmentation: {orig_width}x{orig_height} -> {new_w}x{new_h}")
+    else:
+        image = image
+
     width, height = image.size
     image_area = width * height
 
@@ -1043,6 +1057,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     inputs = processor(images=image, task_inputs=["panoptic"], return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmenter(**inputs)
+
+    # --- Clear Cache after heavy forward pass ---
+    torch.cuda.empty_cache()
+    print("➡ [INFO] OneFormer segmentation completed; GPU cache cleared.")
 
     # Panoptic post-processing
     panoptic_result = processor.post_process_panoptic_segmentation(
@@ -1105,6 +1123,12 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
         x_min, x_max = int(np.min(cols)), int(np.max(cols))
         bbox = [x_min, y_min, x_max, y_max]
 
+        # --- Scale bbox back to original image dimensions ---
+        if scale_factor != 1.0:
+            bbox_original = [int(coord / scale_factor) for coord in bbox]
+        else:
+            bbox_original = bbox
+
         # Use Distance Transform to find the thickest part of the mask for better tooltip placement
         object_mask_uint8 = seg_bool.astype(np.uint8) * 255
         dist_transform = cv2.distanceTransform(object_mask_uint8, cv2.DIST_L2, 5)
@@ -1133,7 +1157,7 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
             "x": perc_x,
             "y": perc_y,
             "sub_category_id": sub_category_id,
-            "bbox": bbox,
+            "bbox": bbox_original,
             "segment_id": segment_id, # For cross-reference with SAM later
             "mask_image": "",
             "_seg_class": matched_user_label,  # internal only; removed before returning
@@ -1301,6 +1325,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
 
         # ---- 7. rasterise at render resolution, anti-aliased once, at the very end ----
         mask_uint8 = rasterise_at_render_res(mask_uint8)
+
+        # --- Upscale mask back to original resolution ---
+        if scale_factor != 1.0:
+            mask_uint8 = cv2.resize(mask_uint8, (orig_width, orig_height), interpolation=cv2.INTER_NEAREST)
 
         mask_img = Image.fromarray(mask_uint8)
         mask_filename = f"mask_{room_id}_{hotspot['image_hotspots_id']}.png"
