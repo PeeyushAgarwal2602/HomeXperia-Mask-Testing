@@ -89,6 +89,7 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = [
     "https://ai.homexperia.com",
     "https://precarnival-ernesto-unbiting.ngrok-free.dev",
+    "https://drop-down-gloss-dismiss.ngrok-free.dev",
     "https://dev.homexperia.com",
     "http://localhost:5173",
     "http://localhost:5174"
