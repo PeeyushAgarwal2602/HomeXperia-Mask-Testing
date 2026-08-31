@@ -198,6 +198,32 @@ HOLE_FILL_FRAC = {
     "window": 0.004,
 }
 
+# --- SAM backend -------------------------------------------------------------
+# SAM 3 is NOT a drop-in for SAM-HQ. Its image API (transformers Sam3Model /
+# Sam3Processor, and the reference sam3.Sam3Processor) accepts a TEXT concept prompt and
+# BOX EXEMPLARS only — processor(...) takes input_boxes / input_boxes_labels and there is
+# no input_points, no dense mask prompt and no multimask_output. This pipeline's prompts
+# were 8 distance-transform points + negatives + a box + OneFormer's mask as a 256px
+# logit prompt, with best-IoU selection over 3 candidates.
+#
+# So the MASK LOGIC below is unchanged and the adapter absorbs the difference:
+#   * the positive box prompt is kept as-is;
+#   * negative POINTS become small negative boxes (SAM 3 supports label 0 boxes), which
+#     preserves their "exclude this" intent;
+#   * the point and mask prompts are dropped — SAM 3 cannot express them;
+#   * SAM 3 returns N instances rather than 3 candidates, and _best_iou_index picks
+#     among them exactly as it picked among the multimask candidates.
+# Everything downstream — the dilated-OneFormer constraint, the shrink guard, the
+# fill-once/cut-once ordering — is untouched.
+#
+# Set SAM_BACKEND=sam_hq to go back instantly; loading also falls back on its own if the
+# SAM 3 weights are unavailable (they are gated on Hugging Face and need approval).
+SAM_BACKEND = os.getenv("SAM_BACKEND", "sam3").strip().lower()
+SAM3_MODEL_ID = os.getenv("SAM3_MODEL_ID", "facebook/sam3")
+SAM3_SCORE_THRESHOLD = 0.5   # instance confidence floor
+SAM3_MASK_THRESHOLD = 0.5    # mask binarisation threshold
+SAM3_NEG_BOX_FRAC = 0.015    # half-size of the box a negative POINT is widened into
+
 DEBUG_SEG = True
 _DEBUG_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Debugs", "Masks")
 _DEBUG_MASK_DIR = os.path.normpath(_DEBUG_MASK_DIR)
@@ -211,15 +237,47 @@ def load_models_if_needed():
     global _models_loaded, processor, segmenter, sam_predictor
     if _models_loaded: return
 
-    print(f"➡ [INFO] Loading OneFormer & SAM-HQ models to {device.upper()}...")
+    print(f"➡ [INFO] Loading OneFormer to {device.upper()}...")
     from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
-    from segment_anything_hq import sam_model_registry, SamPredictor # type:ignore
 
     # Load OneFormer.
     processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
     segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
 
-    # Load SAM-HQ (ViT-B)
+    sam_predictor = None
+    if SAM_BACKEND == "sam3":
+        try:
+            sam_predictor = _load_sam3()
+        except Exception as e:
+            print(f"⚠ [WARN] SAM 3 unavailable ({e}).")
+            print("⚠ [WARN] Its weights are GATED on Hugging Face — request access at "
+                  f"https://huggingface.co/{SAM3_MODEL_ID} and log in with a token that "
+                  "has been approved. Falling back to SAM-HQ for this run.")
+    if sam_predictor is None:
+        sam_predictor = _load_sam_hq()
+
+    print("✅ [SUCCESS] All Models Loaded Successfully!")
+    _models_loaded = True
+
+def _load_sam3():
+    """SAM 3 (facebook/sam3) through transformers, wrapped in _Sam3Adapter."""
+    print(f"➡ [INFO] Loading SAM 3 ({SAM3_MODEL_ID}) to {device.upper()}...")
+    try:
+        from transformers import Sam3Model, Sam3Processor  # type:ignore
+    except ImportError as e:
+        raise ImportError(
+            "this transformers build has no SAM 3 (Sam3Model/Sam3Processor); "
+            "upgrade transformers, e.g. pip install -U transformers"
+        ) from e
+    m = Sam3Model.from_pretrained(SAM3_MODEL_ID).to(device).eval()
+    pr = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+    print("✅ [INFO] SAM 3 loaded.")
+    return _Sam3Adapter(m, pr)
+
+def _load_sam_hq():
+    """SAM-HQ ViT-B — the previous backend, kept as the fallback."""
+    print(f"➡ [INFO] Loading SAM-HQ (vit_b) to {device.upper()}...")
+    from segment_anything_hq import sam_model_registry, SamPredictor  # type:ignore
     sam_checkpoint = "sam_hq_vit_b.pth"
     model_type = "vit_b"
     _orig_load = torch.load
@@ -229,10 +287,8 @@ def load_models_if_needed():
     finally:
         torch.load = _orig_load
     sam.to(device=device)
-    sam_predictor = SamPredictor(sam)
-
-    print("✅ [SUCCESS] All Models Loaded Successfully!")
-    _models_loaded = True
+    print("✅ [INFO] SAM-HQ loaded.")
+    return SamPredictor(sam)
 
 # Depth Anything V2 (metric, indoor) — reconstructs the floor PLANE so the rug
 # visualizer gets a perspective-correct floor quad. Loaded lazily on first use.
@@ -555,6 +611,90 @@ def sample_positive_points(of_bool, bbox, max_points=8):
             uniq.append([px, py])
     return uniq[:max_points]
 
+class _Sam3Adapter:
+    """Presents SAM 3 through the two calls this pipeline makes of a SAM predictor.
+
+    set_image() mirrors SamPredictor.set_image by pre-computing the vision embeddings
+    once per image (model.get_vision_features), so the per-surface calls that follow
+    only run the prompt encoder and mask decoder — without this every prompt would
+    re-encode the whole image through a 300M-parameter backbone, and this pipeline
+    prompts once per surface plus once per solid occluder.
+    """
+
+    def __init__(self, model, processor):
+        self.model = model
+        self.processor = processor
+        self._pil = None
+        self._vision_embeds = None
+        self._target_sizes = None
+        self._hw = None
+
+    def set_image(self, image_rgb):
+        self._pil = Image.fromarray(image_rgb)
+        self._hw = image_rgb.shape[:2]
+        inputs = self.processor(images=self._pil, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            self._vision_embeds = self.model.get_vision_features(pixel_values=inputs.pixel_values)
+        self._target_sizes = inputs.get("original_sizes").tolist()
+
+    def _negative_boxes(self, points, labels):
+        """SAM 3 has no point prompt, but it does take negative BOXES. A negative point
+        becomes a small box centred on it, which carries the same 'not this' meaning."""
+        if points is None or labels is None:
+            return []
+        H, W = self._hw
+        r = max(4, int(SAM3_NEG_BOX_FRAC * max(H, W)))
+        out = []
+        for (px, py), lb in zip(np.asarray(points).reshape(-1, 2), np.asarray(labels).reshape(-1)):
+            if int(lb) != 0:
+                continue
+            out.append([max(0, int(px) - r), max(0, int(py) - r),
+                        min(W - 1, int(px) + r), min(H - 1, int(py) + r)])
+        return out
+
+    def predict(self, points, labels, box):
+        """Return (masks, scores, None) with masks as (N, H, W) bool — the same shape
+        contract SamPredictor.predict had, so _best_iou_index needs no change."""
+        H, W = self._hw
+        boxes = [[float(box[0]), float(box[1]), float(box[2]), float(box[3])]]
+        box_labels = [1]
+        for nb in self._negative_boxes(points, labels):
+            boxes.append([float(v) for v in nb])
+            box_labels.append(0)
+
+        def _run(with_image):
+            kw = dict(input_boxes=[boxes], input_boxes_labels=[box_labels],
+                      return_tensors="pt")
+            if with_image:
+                inp = self.processor(images=self._pil, **kw).to(self.model.device)
+                with torch.no_grad():
+                    return self.model(**inp), inp.get("original_sizes").tolist()
+            inp = self.processor(original_sizes=self._target_sizes, **kw).to(self.model.device)
+            with torch.no_grad():
+                return self.model(vision_embeds=self._vision_embeds, **inp), self._target_sizes
+
+        try:
+            outputs, sizes = _run(with_image=False)
+        except Exception:
+            # cached-embedding path rejected (older/newer signature) — pay for the
+            # re-encode rather than lose the prompt.
+            outputs, sizes = _run(with_image=True)
+
+        res = self.processor.post_process_instance_segmentation(
+            outputs, threshold=SAM3_SCORE_THRESHOLD, mask_threshold=SAM3_MASK_THRESHOLD,
+            target_sizes=sizes)[0]
+        masks = res.get("masks")
+        if masks is None or len(masks) == 0:
+            # No instance cleared the threshold. Hand back one empty candidate: every
+            # caller already treats a collapsed SAM result as "trust OneFormer" via its
+            # shrink guard, so this degrades exactly the way a SAM-HQ miss did.
+            return np.zeros((1, H, W), dtype=bool), np.zeros((1,), np.float32), None
+        m = masks.detach().cpu().numpy() if hasattr(masks, "detach") else np.asarray(masks)
+        scores = res.get("scores")
+        sc = (scores.detach().cpu().numpy() if hasattr(scores, "detach")
+              else np.asarray(scores) if scores is not None else np.ones(len(m), np.float32))
+        return m.astype(bool), sc, None
+
 def mask_to_sam_logits(of_bool, size=256, val=8.0):
     """Encode a binary mask as SAM low-res mask_input logits (fg=+val, bg=-val)."""
     small = cv2.resize(of_bool.astype(np.float32), (size, size), interpolation=cv2.INTER_LINEAR)
@@ -562,7 +702,15 @@ def mask_to_sam_logits(of_bool, size=256, val=8.0):
     return logits[None, :, :].astype(np.float32)
 
 def _sam_predict_safe(predictor, points, labels, box, mask_input):
-    """Call SAM with graceful degradation if a kwarg combination is rejected."""
+    """Call SAM with graceful degradation if a kwarg combination is rejected.
+
+    Backend-agnostic: SAM 3 takes the same (points, labels, box) and returns the same
+    (masks, scores, logits) triple, so both call sites and everything around them are
+    identical whichever model is loaded. mask_input is simply ignored by SAM 3, which
+    has no dense mask prompt.
+    """
+    if isinstance(predictor, _Sam3Adapter):
+        return predictor.predict(points, labels, box)
     pc = np.array(points) if points else None
     pl = np.array(labels) if labels else None
     try:

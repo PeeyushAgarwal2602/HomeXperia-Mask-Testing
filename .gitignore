@@ -20,6 +20,12 @@ image_cache/
 geometry-debug/
 homeexperia-frontend/
 
+sam3/
+Compare/
+*_Debugs/
+*.pptx
+*.pdf
+
 flask.log
 error.log
 access.log
