@@ -239,8 +239,8 @@ def load_models_if_needed():
     from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 
     # Load OneFormer.
-    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
-    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
+    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_tiny")
+    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_tiny").to(device)
 
     sam_predictor = None
     if SAM_BACKEND == "sam3":
@@ -304,7 +304,7 @@ def _load_sam_hq():
 
 # Depth Anything V2 (metric, indoor) — reconstructs the floor PLANE so the rug
 # visualizer gets a perspective-correct floor quad. Loaded lazily on first use.
-DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
 def load_depth_model_if_needed():
     global _depth_processor, _depth_model
@@ -1184,7 +1184,8 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
 
     # --- Pre-segmentation downscaling ---
     orig_width, orig_height = image.size
-    MAX_SEG_DIM = 1536 
+    # MAX_SEG_DIM = 1536 
+    MAX_SEG_DIM = 1024 
     scale_factor = 1.0
     
     if max(orig_width, orig_height) > MAX_SEG_DIM:
@@ -1199,10 +1200,16 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     width, height = image.size
     image_area = width * height
 
+    # Ensure segmenter is on the GPU before running
+    segmenter.to(device)
+
     # Run OneFormer
     inputs = processor(images=image, task_inputs=["panoptic"], return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmenter(**inputs)
+
+    # --- NEW: Move OneFormer to CPU to free VRAM for SAM ---
+    segmenter.to("cpu")
 
     # --- Clear Cache after heavy forward pass ---
     torch.cuda.empty_cache()
