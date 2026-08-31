@@ -1,4 +1,10 @@
-transformers>=5.0
+# SAM 3 comes via ultralytics (SAM3Predictor), NOT via transformers — that keeps
+# transformers on its current major version, which OneFormer, BiRefNet
+# (trust_remote_code) and Depth-Anything all depend on. Ultralytics' CLIP extra is only
+# needed for TEXT prompts; this pipeline uses visual prompts, so skip it.
+# sam3.pt is not auto-downloaded: fetch it with your approved Hugging Face access.
+transformers 
+ultralytics>=8.4
 torch 
 torchvision 
 opencv-python 

@@ -199,30 +199,28 @@ HOLE_FILL_FRAC = {
 }
 
 # --- SAM backend -------------------------------------------------------------
-# SAM 3 is NOT a drop-in for SAM-HQ. Its image API (transformers Sam3Model /
-# Sam3Processor, and the reference sam3.Sam3Processor) accepts a TEXT concept prompt and
-# BOX EXEMPLARS only — processor(...) takes input_boxes / input_boxes_labels and there is
-# no input_points, no dense mask prompt and no multimask_output. This pipeline's prompts
-# were 8 distance-transform points + negatives + a box + OneFormer's mask as a 256px
-# logit prompt, with best-IoU selection over 3 candidates.
+# SAM 3 runs through ULTRALYTICS, not through transformers or Meta's sam3 repo.
 #
-# So the MASK LOGIC below is unchanged and the adapter absorbs the difference:
-#   * the positive box prompt is kept as-is;
-#   * negative POINTS become small negative boxes (SAM 3 supports label 0 boxes), which
-#     preserves their "exclude this" intent;
-#   * the point and mask prompts are dropped — SAM 3 cannot express them;
-#   * SAM 3 returns N instances rather than 3 candidates, and _best_iou_index picks
-#     among them exactly as it picked among the multimask candidates.
-# Everything downstream — the dilated-OneFormer constraint, the shrink guard, the
-# fill-once/cut-once ordering — is untouched.
+# That choice buys back the prompts. Meta's own image API (and the transformers
+# Sam3Model/Sam3Processor wrapper) exposes a text concept prompt and BOX EXEMPLARS only
+# — no points, no dense mask prompt, no multimask — so going that way would have meant
+# throwing away most of what this pipeline prompts SAM with. Ultralytics ships a
+# SAM2-compatible visual-prompt predictor for SAM 3 whose contract is
+#   inference(im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False)
+# which is exactly the prompt set the SAM-HQ path used, low-res 256px mask included.
+# So the mask logic below is untouched and the adapter is close to a pass-through.
 #
-# Set SAM_BACKEND=sam_hq to go back instantly; loading also falls back on its own if the
-# SAM 3 weights are unavailable (they are gated on Hugging Face and need approval).
+# It also avoids a transformers major-version bump: SAM 3 in transformers needs v5, and
+# OneFormer, BiRefNet (trust_remote_code) and Depth-Anything all ride on transformers
+# too. Going through Ultralytics keeps SAM 3 off that dependency entirely.
+#
+# Weights are NOT auto-downloaded — download sam3.pt with your approved Hugging Face
+# access and put it beside sam_hq_vit_b.pth, or point SAM3_WEIGHTS at it. Ultralytics'
+# CLIP extra is only needed for TEXT prompts; this pipeline uses visual prompts, so that
+# install step (a common source of dependency conflicts) is not needed.
 SAM_BACKEND = os.getenv("SAM_BACKEND", "sam3").strip().lower()
-SAM3_MODEL_ID = os.getenv("SAM3_MODEL_ID", "facebook/sam3")
-SAM3_SCORE_THRESHOLD = 0.5   # instance confidence floor
-SAM3_MASK_THRESHOLD = 0.5    # mask binarisation threshold
-SAM3_NEG_BOX_FRAC = 0.015    # half-size of the box a negative POINT is widened into
+SAM3_WEIGHTS = os.getenv("SAM3_WEIGHTS", "sam3.pt")
+SAM3_IMGSZ = 1024
 
 DEBUG_SEG = True
 _DEBUG_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Debugs", "Masks")
@@ -250,9 +248,8 @@ def load_models_if_needed():
             sam_predictor = _load_sam3()
         except Exception as e:
             print(f"⚠ [WARN] SAM 3 unavailable ({e}).")
-            print("⚠ [WARN] Its weights are GATED on Hugging Face — request access at "
-                  f"https://huggingface.co/{SAM3_MODEL_ID} and log in with a token that "
-                  "has been approved. Falling back to SAM-HQ for this run.")
+            print(f"⚠ [WARN] Check that {SAM3_WEIGHTS} exists and that ultralytics is "
+                  "up to date. Falling back to SAM-HQ for this run.")
     if sam_predictor is None:
         sam_predictor = _load_sam_hq()
 
@@ -260,19 +257,34 @@ def load_models_if_needed():
     _models_loaded = True
 
 def _load_sam3():
-    """SAM 3 (facebook/sam3) through transformers, wrapped in _Sam3Adapter."""
-    print(f"➡ [INFO] Loading SAM 3 ({SAM3_MODEL_ID}) to {device.upper()}...")
+    """SAM 3 via Ultralytics' visual-prompt predictor, wrapped in _Sam3Adapter."""
+    print(f"➡ [INFO] Loading SAM 3 ({SAM3_WEIGHTS}) via Ultralytics to {device.upper()}...")
+    if not os.path.exists(SAM3_WEIGHTS):
+        raise FileNotFoundError(
+            f"{SAM3_WEIGHTS} not found. Ultralytics does not auto-download SAM 3 — "
+            "fetch it with your approved Hugging Face access, or set SAM3_WEIGHTS.")
     try:
-        from transformers import Sam3Model, Sam3Processor  # type:ignore
+        import ultralytics  # type:ignore
+        from ultralytics.models import sam as _usam  # type:ignore
     except ImportError as e:
+        raise ImportError("ultralytics is not installed; pip install -U ultralytics") from e
+
+    # SAM3Predictor is the SAM2-compatible VISUAL-prompt class. SAM3SemanticPredictor is
+    # the text/concept one and accepts no points, so it is deliberately not used here.
+    cls = getattr(_usam, "SAM3Predictor", None)
+    if cls is None:
         raise ImportError(
-            "this transformers build has no SAM 3 (Sam3Model/Sam3Processor); "
-            "upgrade transformers, e.g. pip install -U transformers"
-        ) from e
-    m = Sam3Model.from_pretrained(SAM3_MODEL_ID).to(device).eval()
-    pr = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
-    print("✅ [INFO] SAM 3 loaded.")
-    return _Sam3Adapter(m, pr)
+            f"ultralytics {getattr(ultralytics, '__version__', '?')} has no SAM3Predictor; "
+            "pip install -U ultralytics")
+
+    predictor = cls(overrides={
+        "model": SAM3_WEIGHTS, "task": "segment", "mode": "predict",
+        "imgsz": SAM3_IMGSZ, "conf": 0.25, "save": False, "verbose": False,
+        "device": device,
+    })
+    predictor.setup_model()
+    print("✅ [INFO] SAM 3 loaded (Ultralytics visual-prompt predictor).")
+    return _Sam3Adapter(predictor)
 
 def _load_sam_hq():
     """SAM-HQ ViT-B — the previous backend, kept as the fallback."""
@@ -612,88 +624,74 @@ def sample_positive_points(of_bool, bbox, max_points=8):
     return uniq[:max_points]
 
 class _Sam3Adapter:
-    """Presents SAM 3 through the two calls this pipeline makes of a SAM predictor.
+    """Presents Ultralytics' SAM 3 through the calls this pipeline makes of a predictor.
 
-    set_image() mirrors SamPredictor.set_image by pre-computing the vision embeddings
-    once per image (model.get_vision_features), so the per-surface calls that follow
-    only run the prompt encoder and mask decoder — without this every prompt would
-    re-encode the whole image through a 300M-parameter backbone, and this pipeline
-    prompts once per surface plus once per solid occluder.
+    Ultralytics' SAM predictors already work the way SamPredictor did: set_image()
+    encodes once and stores the features, then each prompt call runs only the prompt
+    encoder and mask decoder. This pipeline prompts once per surface plus once per solid
+    occluder, so that caching is what keeps the cost sane.
     """
 
-    def __init__(self, model, processor):
-        self.model = model
-        self.processor = processor
-        self._pil = None
-        self._vision_embeds = None
-        self._target_sizes = None
+    def __init__(self, predictor):
+        self.p = predictor
         self._hw = None
 
     def set_image(self, image_rgb):
-        self._pil = Image.fromarray(image_rgb)
+        # Ultralytics documents set_image as taking "a numpy array representing an image
+        # read by cv2" — i.e. BGR. The pipeline hands us RGB (it was feeding SAM-HQ,
+        # which wanted RGB), so convert here rather than change the call site.
         self._hw = image_rgb.shape[:2]
-        inputs = self.processor(images=self._pil, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            self._vision_embeds = self.model.get_vision_features(pixel_values=inputs.pixel_values)
-        self._target_sizes = inputs.get("original_sizes").tolist()
-
-    def _negative_boxes(self, points, labels):
-        """SAM 3 has no point prompt, but it does take negative BOXES. A negative point
-        becomes a small box centred on it, which carries the same 'not this' meaning."""
-        if points is None or labels is None:
-            return []
-        H, W = self._hw
-        r = max(4, int(SAM3_NEG_BOX_FRAC * max(H, W)))
-        out = []
-        for (px, py), lb in zip(np.asarray(points).reshape(-1, 2), np.asarray(labels).reshape(-1)):
-            if int(lb) != 0:
-                continue
-            out.append([max(0, int(px) - r), max(0, int(py) - r),
-                        min(W - 1, int(px) + r), min(H - 1, int(py) + r)])
-        return out
-
-    def predict(self, points, labels, box):
-        """Return (masks, scores, None) with masks as (N, H, W) bool — the same shape
-        contract SamPredictor.predict had, so _best_iou_index needs no change."""
-        H, W = self._hw
-        boxes = [[float(box[0]), float(box[1]), float(box[2]), float(box[3])]]
-        box_labels = [1]
-        for nb in self._negative_boxes(points, labels):
-            boxes.append([float(v) for v in nb])
-            box_labels.append(0)
-
-        def _run(with_image):
-            kw = dict(input_boxes=[boxes], input_boxes_labels=[box_labels],
-                      return_tensors="pt")
-            if with_image:
-                inp = self.processor(images=self._pil, **kw).to(self.model.device)
-                with torch.no_grad():
-                    return self.model(**inp), inp.get("original_sizes").tolist()
-            inp = self.processor(original_sizes=self._target_sizes, **kw).to(self.model.device)
-            with torch.no_grad():
-                return self.model(vision_embeds=self._vision_embeds, **inp), self._target_sizes
-
         try:
-            outputs, sizes = _run(with_image=False)
+            self.p.reset_image()
         except Exception:
-            # cached-embedding path rejected (older/newer signature) — pay for the
-            # re-encode rather than lose the prompt.
-            outputs, sizes = _run(with_image=True)
+            pass
+        self.p.set_image(cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
 
-        res = self.processor.post_process_instance_segmentation(
-            outputs, threshold=SAM3_SCORE_THRESHOLD, mask_threshold=SAM3_MASK_THRESHOLD,
-            target_sizes=sizes)[0]
-        masks = res.get("masks")
-        if masks is None or len(masks) == 0:
-            # No instance cleared the threshold. Hand back one empty candidate: every
-            # caller already treats a collapsed SAM result as "trust OneFormer" via its
-            # shrink guard, so this degrades exactly the way a SAM-HQ miss did.
-            return np.zeros((1, H, W), dtype=bool), np.zeros((1,), np.float32), None
-        m = masks.detach().cpu().numpy() if hasattr(masks, "detach") else np.asarray(masks)
-        scores = res.get("scores")
-        sc = (scores.detach().cpu().numpy() if hasattr(scores, "detach")
-              else np.asarray(scores) if scores is not None else np.ones(len(m), np.float32))
-        return m.astype(bool), sc, None
+    def _empty(self):
+        h, w = self._hw
+        return np.zeros((1, h, w), dtype=bool), np.zeros((1,), np.float32), None
+
+    def predict(self, points, labels, box, mask_input):
+        """Return (masks, scores, None) with masks (N, H, W) bool — the same contract
+        SamPredictor.predict had, so _best_iou_index needs no change."""
+        h, w = self._hw
+        bboxes = None
+        if box is not None:
+            b = np.asarray(box).reshape(-1).tolist()
+            bboxes = [[float(b[0]), float(b[1]), float(b[2]), float(b[3])]]
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 2).tolist() if points else None
+        lbs = np.asarray(labels, dtype=np.int32).reshape(-1).tolist() if labels else None
+
+        def _call(**kw):
+            res = self.p(bboxes=bboxes, points=pts, labels=lbs, **kw)
+            return res[0] if isinstance(res, (list, tuple)) else res
+
+        # The same graceful degradation the SAM-HQ path used: drop the dense mask prompt,
+        # then the multimask flag, rather than lose the prediction to a kwarg mismatch.
+        try:
+            r = _call(masks=mask_input, multimask_output=True)
+        except Exception:
+            try:
+                r = _call(multimask_output=True)
+            except Exception:
+                r = _call()
+
+        m = getattr(r, "masks", None)
+        data = getattr(m, "data", None) if m is not None else None
+        if data is None or len(data) == 0:
+            return self._empty()
+        arr = data.detach().cpu().numpy() if hasattr(data, "detach") else np.asarray(data)
+        arr = arr.reshape(-1, *arr.shape[-2:])
+        arr = arr > 0.5 if arr.dtype != bool else arr
+        if arr.shape[-2:] != (h, w):
+            arr = np.stack([cv2.resize(a.astype(np.uint8), (w, h),
+                                       interpolation=cv2.INTER_NEAREST) > 0 for a in arr])
+        if not len(arr):
+            return self._empty()
+        conf = getattr(getattr(r, "boxes", None), "conf", None)
+        sc = (conf.detach().cpu().numpy() if hasattr(conf, "detach")
+              else np.ones(len(arr), np.float32))
+        return arr, sc, None
 
 def mask_to_sam_logits(of_bool, size=256, val=8.0):
     """Encode a binary mask as SAM low-res mask_input logits (fg=+val, bg=-val)."""
@@ -706,11 +704,11 @@ def _sam_predict_safe(predictor, points, labels, box, mask_input):
 
     Backend-agnostic: SAM 3 takes the same (points, labels, box) and returns the same
     (masks, scores, logits) triple, so both call sites and everything around them are
-    identical whichever model is loaded. mask_input is simply ignored by SAM 3, which
-    has no dense mask prompt.
+    identical whichever model is loaded, mask_input included — Ultralytics' SAM 3
+    visual-prompt predictor takes the same 256px low-res mask prompt SAM-HQ did.
     """
     if isinstance(predictor, _Sam3Adapter):
-        return predictor.predict(points, labels, box)
+        return predictor.predict(points, labels, box, mask_input)
     pc = np.array(points) if points else None
     pl = np.array(labels) if labels else None
     try:
