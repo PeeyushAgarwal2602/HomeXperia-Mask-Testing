@@ -220,7 +220,17 @@ HOLE_FILL_FRAC = {
 # install step (a common source of dependency conflicts) is not needed.
 SAM_BACKEND = os.getenv("SAM_BACKEND", "sam3").strip().lower()
 SAM3_WEIGHTS = os.getenv("SAM3_WEIGHTS", "sam3.pt")
-SAM3_IMGSZ = 1024
+
+# Encoder input size. Ultralytics' own default is 640 and it rounds up to a multiple of
+# the ViT stride (14), so 640 -> 644 and 1024 -> 1036. Cost is quadratic in tokens:
+# (1036/14)^2 = 5476 tokens against (644/14)^2 = 2116, so 1024 costs 2.6x the activation
+# memory of 640 for the same picture. On a 14.5GB T4 that difference is the difference
+# between running and not.
+SAM3_IMGSZ = int(os.getenv("SAM3_IMGSZ", "640"))
+
+# fp16 weights and activations. Ultralytics spells this `quantize=16` (it replaced the
+# older `half` arg) and their own SAM 3 examples pass it. Roughly halves encoder memory.
+SAM3_QUANTIZE = os.getenv("SAM3_QUANTIZE", "16").strip()
 
 DEBUG_SEG = True
 _DEBUG_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Debugs", "Masks")
@@ -277,13 +287,39 @@ def _load_sam3():
             f"ultralytics {getattr(ultralytics, '__version__', '?')} has no SAM3Predictor; "
             "pip install -U ultralytics")
 
-    predictor = cls(overrides={
+    overrides = {
         "model": SAM3_WEIGHTS, "task": "segment", "mode": "predict",
         "imgsz": SAM3_IMGSZ, "conf": 0.25, "save": False, "verbose": False,
         "device": device,
-    })
+    }
+    if SAM3_QUANTIZE in ("16", "fp16"):
+        overrides["quantize"] = 16
+    predictor = cls(overrides=overrides)
+
+    # DISABLE torch.compile. This is the fix for the CUDA OOM on a T4, and it has to be
+    # done here rather than through overrides because of an Ultralytics bug:
+    #
+    #   cfg/default.yaml   compile: False        # documented as "False=off"
+    #   SAM3Predictor.get_model()                build_interactive_sam3(..., compile=self.args.compile)
+    #   sam3/encoder.py    if compile_mode is not None: torch.compile(self.forward, ...)
+    #
+    # `False is not None` is True, so the documented "off" value still compiles the
+    # vision backbone through inductor — the traceback ran through _dynamo/aot_autograd
+    # and logged "Not enough SMs to use max_autotune_gemm mode" before dying. Inductor's
+    # autotuning workspace is what exhausted the 14.5GB card: OneFormer had already been
+    # moved to CPU and the cache emptied, and SAM 3 alone still held 14.3GB.
+    #
+    # Passing compile=None through overrides does not work either — their validator
+    # rejects it outright ("'compile=None' is invalid. 'compile' must not be None"). So
+    # set it after cfg validation and before get_model() reads it.
+    try:
+        predictor.args.compile = None
+    except Exception:
+        print("⚠ [WARN] Could not disable torch.compile for SAM 3; expect high VRAM use.")
+
     predictor.setup_model()
-    print("✅ [INFO] SAM 3 loaded (Ultralytics visual-prompt predictor).")
+    print(f"✅ [INFO] SAM 3 loaded (Ultralytics visual-prompt predictor, imgsz={SAM3_IMGSZ}, "
+          f"quantize={overrides.get('quantize', 32)}, torch.compile=off).")
     return _Sam3Adapter(predictor)
 
 def _load_sam_hq():
@@ -641,11 +677,34 @@ class _Sam3Adapter:
         # read by cv2" — i.e. BGR. The pipeline hands us RGB (it was feeding SAM-HQ,
         # which wanted RGB), so convert here rather than change the call site.
         self._hw = image_rgb.shape[:2]
+        bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         try:
             self.p.reset_image()
         except Exception:
             pass
-        self.p.set_image(cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+        try:
+            self.p.set_image(bgr)
+            return
+        except torch.cuda.OutOfMemoryError:
+            pass
+        # An OOM here used to take the whole service down: the failed allocation stayed
+        # resident, so every later request died instantly at the same place (observed —
+        # a follow-up request OOMed after 2.2s with 14.35GB still allocated). Release it
+        # and retry once at a smaller encoder size before giving up.
+        print("⚠ [WARN] SAM 3 ran out of VRAM at "
+              f"imgsz={SAM3_IMGSZ}; clearing cache and retrying smaller.")
+        try:
+            self.p.reset_image()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            self.p.args.imgsz = max(378, int(SAM3_IMGSZ * 0.625))
+            self.p.set_image(bgr)
+            print(f"➡ [INFO] SAM 3 recovered at imgsz={self.p.args.imgsz}.")
+        except Exception:
+            torch.cuda.empty_cache()
+            raise
 
     def _empty(self):
         h, w = self._hw
@@ -666,10 +725,30 @@ class _Sam3Adapter:
             res = self.p(bboxes=bboxes, points=pts, labels=lbs, **kw)
             return res[0] if isinstance(res, (list, tuple)) else res
 
+        # The mask prompt has to be RE-EXPRESSED, not forwarded. SAM-HQ took a 256x256
+        # map of +-8 logits (what mask_to_sam_logits builds); Ultralytics wants a
+        # FULL-RESOLUTION BINARY mask, because _prepare_prompts does
+        #     masks = np.asarray(masks, dtype=np.uint8)
+        #     masks = np.stack([LetterBox(dst_shape, interpolation=INTER_NEAREST)(image=x) ...])
+        # Handing it the logits would fail silently in the worst way: the uint8 cast wraps
+        # -8.0 to 248, so every background pixel arrives as a strong POSITIVE, and a
+        # 256x256 array would then be letterboxed as though it were the whole image.
+        # Thresholding at 0 and resizing to the image recovers the intended prompt; the
+        # only thing lost is the 256px quantisation, which SAM-HQ imposed anyway.
+        mask_prompt = None
+        if mask_input is not None:
+            try:
+                mi = np.asarray(mask_input, dtype=np.float32)
+                mi = mi.reshape(-1, *mi.shape[-2:])[0]
+                mask_prompt = cv2.resize((mi > 0).astype(np.uint8), (w, h),
+                                         interpolation=cv2.INTER_NEAREST)[None]
+            except Exception:
+                mask_prompt = None
+
         # The same graceful degradation the SAM-HQ path used: drop the dense mask prompt,
         # then the multimask flag, rather than lose the prediction to a kwarg mismatch.
         try:
-            r = _call(masks=mask_input, multimask_output=True)
+            r = _call(masks=mask_prompt, multimask_output=True)
         except Exception:
             try:
                 r = _call(multimask_output=True)
