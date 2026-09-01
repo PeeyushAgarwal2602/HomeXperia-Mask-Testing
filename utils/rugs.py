@@ -167,7 +167,8 @@ def _detect_floor_quad(room_img, floor_mask=None):
         coords = cv2.findNonZero(clean_mask)
 
         if coords is not None:
-            min_y = int(np.min(coords[:, 0, 1]))
+            # findNonZero's shape varies by OpenCV build — see utils/floor.py.
+            min_y = int(np.min(np.asarray(coords).reshape(-1, 2)[:, 1]))
             offset = int(H * 0.02)
             floor_top_y = max(int(H * 0.20), min_y - offset)
     else:

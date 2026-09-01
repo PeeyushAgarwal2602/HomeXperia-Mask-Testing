@@ -718,8 +718,20 @@ class _Sam3Adapter:
         if box is not None:
             b = np.asarray(box).reshape(-1).tolist()
             bboxes = [[float(b[0]), float(b[1]), float(b[2]), float(b[3])]]
-        pts = np.asarray(points, dtype=np.float32).reshape(-1, 2).tolist() if points else None
-        lbs = np.asarray(labels, dtype=np.int32).reshape(-1).tolist() if labels else None
+        # ONE prompt carrying N points, not N prompts of one point each. Ultralytics reads
+        #   points (N, 2)            -> N SEPARATE prompts, one point apiece
+        #   points (N, num_points, 2) -> N prompts with num_points each
+        # and SAM-HQ's predict() meant the first shape to be a single multi-point prompt.
+        # Passing the flat shape made every point its own prompt while the box stayed a
+        # batch of one, so the prompt encoder tried to concatenate batch 1 against batch
+        # N and raised "Sizes of tensors must match except in dimension 1. Expected size 1
+        # but got size 8". The 4/6/7/8 in those messages were literally the point counts
+        # from sample_positive_points. Wrapping in a leading axis keeps the batch at 1.
+        pts = lbs = None
+        if points:
+            pts = [np.asarray(points, dtype=np.float32).reshape(-1, 2).tolist()]
+            if labels:
+                lbs = [np.asarray(labels, dtype=np.int32).reshape(-1).tolist()]
 
         def _call(**kw):
             res = self.p(bboxes=bboxes, points=pts, labels=lbs, **kw)

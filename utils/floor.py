@@ -291,7 +291,9 @@ def apply_pattern(room_img, floor_tex, mask_img, repeat=3, rotation_deg=0, grout
             return room_img
             
         coords_hom = np.ones((len(coords), 3), dtype=np.float32)
-        coords_hom[:, :2] = coords[:, 0, :]
+        # findNonZero's shape varies by OpenCV build — (N,1,2) locally, (N,2) in the
+        # deploy env, where coords[:, 0, :] raised "too many indices for array".
+        coords_hom[:, :2] = np.asarray(coords).reshape(-1, 2)
         
         flat_hom_scale = (M_inv @ coords_hom.T).T
         valid_mask_scale = flat_hom_scale[:, 2] > 0.001 
