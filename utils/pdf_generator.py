@@ -5,6 +5,7 @@ import qrcode
 import base64
 import tempfile
 import requests
+from urllib.parse import urlparse, unquote
 from fpdf import FPDF
 from PIL import Image as PILImage, ImageDraw, ImageOps
 
@@ -51,11 +52,34 @@ def process_b64_image(b64_string):
         
     return file_path
 
+_LOCAL_SERVED_FOLDERS = {
+    '/generated/': 'generated',
+}
+
+def resolve_local_served_path(url):
+    if not url or not isinstance(url, str):
+        return None
+    if os.path.isfile(url): # already a local filesystem path
+        return url
+    try:
+        url_path = unquote(urlparse(url).path) # strip scheme/host/query
+    except Exception:
+        return None
+    for prefix, folder in _LOCAL_SERVED_FOLDERS.items():
+        idx = url_path.find(prefix)
+        if idx != -1:
+            filename = os.path.basename(url_path[idx + len(prefix):])
+            candidate = os.path.join(folder, filename) if filename else None
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    return None
+
 def download_image_as_pil(url):
     try:
         if not url: return None
-        if os.path.isfile(url):
-            return PILImage.open(url)
+        local_path = resolve_local_served_path(url)
+        if local_path:
+            return PILImage.open(local_path)
         headers = {'User-Agent': 'Mozilla/5.0'}
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
@@ -70,7 +94,33 @@ def pil_to_bytes(pil_img):
     output.seek(0)
     return output
 
-def draw_page_header(pdf, brand_logo_url, brand_name):
+def pil_to_jpeg_bytes(pil_img, quality=90):
+    if pil_img.mode not in ("RGB", "L"):
+        pil_img = pil_img.convert("RGB")
+    output = io.BytesIO()
+    pil_img.save(output, format="JPEG", quality=quality, optimize=True)
+    output.seek(0)
+    return output
+
+def collect_distinct_product_names(hotspots):
+    seen = set()
+    names = []
+    for item in hotspots or []:
+        product = item.get('product', {}) or {}
+        raw = product.get('product_name')
+        if not raw:
+            continue
+        name = str(raw).strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name.upper())
+    return names
+
+def draw_page_header(pdf, brand_logo_url, brand_name, product_names=None):
     pdf.set_line_width(0.3)
     pdf.line(px2mm(95), px2mm(90), px2mm(1345), px2mm(90))
 
@@ -101,6 +151,43 @@ def draw_page_header(pdf, brand_logo_url, brand_name):
         pdf.set_xy(px2mm(95), px2mm(18))
         pdf.cell(px2mm(138), px2mm(52), str(brand_name).upper(), align='L')
 
+    # --- Applied-pattern Catalogue names (Top Center) ---
+    if product_names:
+        SEP = " / "
+        ELLIPSIS = "…"
+
+        band_x = px2mm(340)
+        band_y = px2mm(8)
+        band_w = px2mm(760)
+        band_h = px2mm(75)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Roboto", 'B', pt_size(30))
+
+        full = SEP.join(product_names)
+        if pdf.get_string_width(full) <= band_w:
+            header_text = full
+        else:
+            # Drop whole names from the end and signal the omission with an ellipsis, keeping every shown name fully readable.
+            kept = []
+            for name in product_names:
+                trial = SEP.join(kept + [name]) + SEP + ELLIPSIS
+                if kept and pdf.get_string_width(trial) > band_w:
+                    break
+                kept.append(name)
+            if not kept:
+                kept = [product_names[0]]
+            if len(kept) < len(product_names):
+                header_text = SEP.join(kept) + SEP + ELLIPSIS
+            else:
+                header_text = SEP.join(kept)
+            # Safety net for a single name wider than the band: clamp characters
+            # so the text can never spill past the divider.
+            while len(header_text) > 1 and pdf.get_string_width(header_text) > band_w:
+                header_text = header_text[:-2] + ELLIPSIS
+
+        pdf.set_xy(band_x, band_y)
+        pdf.cell(band_w, band_h, txt=header_text, align='C')
 
 def draw_swatch_details(pdf, product_data, category):
     pdf.set_text_color(0, 0, 0)
@@ -108,8 +195,10 @@ def draw_swatch_details(pdf, product_data, category):
     p_name = product_data.get('product_name', 'Unknown Product').title()
     p_width = product_data.get('width', '-').title()
     p_weight = str(product_data.get('weight', '-'))
-    p_comp = product_data.get('manufacture_type', '-').title()
-    p_wash = product_data.get('wash_code', '-').title()
+    # p_comp = product_data.get('manufacture_type', '-').title()
+    p_comp = product_data.get('composition', '100% Poly').title()
+    # p_wash = product_data.get('wash_code', '-').title()
+    p_wash = product_data.get('wash_code', 'Dry Clean Only').title()
     p_end_use = product_data.get('end_use', category)
     
     brand_logo_url = product_data.get('brand_logo', None)
@@ -310,25 +399,32 @@ def generate_report_pdf(data):
             # --- Processed Room Image ---
             if final_image_url:
                 pdf.add_page()
-                draw_page_header(pdf, brand_logo_url, brand_name)
-                
+                draw_page_header(pdf, brand_logo_url, brand_name, product_names=collect_distinct_product_names(hotspots))
+
                 pil_img = download_image_as_pil(final_image_url)
                 if pil_img:
                     orig_w, orig_h = pil_img.size
                     max_w, max_h = 1248, 894
 
                     scale = min(max_w / orig_w, max_h / orig_h)
-                    target_w = int(orig_w * scale)
-                    target_h = int(orig_h * scale)
-                    
-                    final_pil = pil_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
-                    temp_img = pil_to_bytes(final_pil)
-                    
-                    # Center the image horizontally and vertically within the 1248x894 bounding box
-                    start_x = 96 + (max_w - target_w) / 2
-                    start_y = 90 + (max_h - target_h) / 2
-                    
-                    pdf.image(temp_img, x=px2mm(start_x), y=px2mm(start_y), w=px2mm(target_w), h=px2mm(target_h))
+                    disp_w = int(orig_w * scale)
+                    disp_h = int(orig_h * scale)
+
+                    # ---- Room-image HD knobs -------------
+                    TARGET_DPI   = 300   # embed sharpness. Higher = crisper zoom + bigger PDF. 240 ≈ today's PDF size, 300 = print-grade.
+                    JPEG_QUALITY = 92    # 85 (smaller) .. 92 (sharper). >95 bloats for little gain.
+
+                    px_w = min(orig_w, round(disp_w * TARGET_DPI / 96.0))
+                    px_h = min(orig_h, round(disp_h * TARGET_DPI / 96.0))
+
+                    final_pil = pil_img.resize((px_w, px_h), PILImage.Resampling.LANCZOS)
+                    temp_img = pil_to_jpeg_bytes(final_pil, quality=JPEG_QUALITY)
+
+                    # Center within the 1248x894 box
+                    start_x = 96 + (max_w - disp_w) / 2
+                    start_y = 90 + (max_h - disp_h) / 2
+
+                    pdf.image(temp_img, x=px2mm(start_x), y=px2mm(start_y), w=px2mm(disp_w), h=px2mm(disp_h))
                     # pdf.image(temp_qr.name, x=px2mm(1176), y=px2mm(818), w=px2mm(145), h=px2mm(145))
 
             # --- Pattern Swatch Pages ---

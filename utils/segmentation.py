@@ -92,6 +92,16 @@ ONEFORMER_EXTENT_CLASSES = {"wall", "floor", "curtain"}
 # Surfaces from which precise occluder silhouettes should be subtracted.
 OCCLUDER_SUBTRACT_CLASSES = {"curtain", "wall"}
 
+# Labels that, when OneFormer assigns them to a small interior island fully
+# enclosed by a window/door's own pixels, are trusted to be a mislabeled
+# part of the SAME surface (a mullion/frame divider caught as "wall" by
+# glass reflection/glare) rather than a real foreground occluder — see
+# fill_void_gaps_in_hull. Deliberately an allowlist of what's safe to
+# repaint, not a blocklist of furniture classes: ADE20K has ~150 classes
+# and a blocklist would always be one missed class away from silently
+# painting curtain fabric over a real object.
+REPAINTABLE_OCCLUDER_LABELS = {"wall", "ceiling", "curtain", "windowpane", "door"}
+
 # Occluder segments are admitted on an ABSOLUTE pixel floor, not a fraction of the
 # image. A fraction scales the wrong way: 0.05% of a 3840x2063 upload is 3960 px, so a
 # whole dried-branch segment was dropped HERE — before build_occluder_union_birefnet
@@ -145,6 +155,33 @@ VOID_MAX_INRADIUS_FRAC = 0.015
 #    stippled seams.
 VOID_MIN_POCKET_PX = 100
 
+# 4. HALO REACH — the partial fill, and the reason the three gates above are no longer
+#    the last word.
+#
+#    Those gates are all-or-nothing PER POCKET, and that is what puts an untextured blob
+#    back around an object whose cutout is otherwise pixel-accurate. A bushy plant's void
+#    envelope is one single connected pocket that reaches from the leaf tips right out
+#    into open wall, so its inradius is nowhere near "shell-thin" and THINNESS rejects the
+#    whole thing — envelope, leaf gaps and all. The surface never claims it, the cut never
+#    touches it (it is not occluder), and it survives into the final mask as a hole many
+#    times the size of the silhouette BiRefNet actually produced. Measured on the reported
+#    curtain room: the mattes were clean and the holes around them were not.
+#
+#    So a pocket that fails as a WHOLE is no longer discarded as a whole. It gives up its
+#    SHELL — the part within this reach of the occluder in front of this surface, or of
+#    the surface itself, the two things a halo lies between. Only its deep core, far from
+#    both, stays refused, and that core is precisely the solid unlabelled object (a
+#    mirror, a picture) the thinness gate exists to protect. Whatever of the shell is
+#    genuinely the object is removed again by the single cut immediately afterwards —
+#    fill-once/cut-once is unchanged, only the fill's granularity is.
+#
+#    0.025 of the long side is ~38px at the 1536px analysis size, comfortably past the
+#    54px-worst-case halo measured at 3840px (~22px here) and well short of the
+#    ottoman-sized solids the thinness gate refuses. Measured on synthetic envelopes:
+#    a thin one (20px at 1536) is unaffected, because it already passed every gate; a
+#    thick one (50px) went from a hole 5.9x the matte's area to 1.0x.
+HALO_REACH_FRAC = 0.025
+
 # Validation gate: reject the heal if the final mask outgrew OneFormer's own surface by
 # more than this. A complete fill is a powerful operation and needs a guard — prod's
 # bbox fill had no ceiling and that is why v2.1 abandoned it. Deliberately loose: this
@@ -182,8 +219,11 @@ STRAIGHTEN_REACH_FRAC = 0.015
 
 # Classes that still get the guided-filter edge snap. Kept deliberately until the new
 # boundary generation is verified to produce clean edges unaided; the wall has been
-# excluded since v2.4 because it measurably looked better without it.
-EDGE_REFINE_CLASSES = {"curtain", "floor", "rug", "window", "door"}
+# excluded since v2.4 because it measurably looked better without it. window/door are
+# excluded too: they take their own path (see the seg_class in ("window", "door")
+# branch in process_scene_pipeline) where this would re-carve exactly what
+# fill_void_gaps_in_hull just decided to keep.
+EDGE_REFINE_CLASSES = {"curtain", "floor", "rug"}
 
 # Max enclosed-hole size to fill, as a fraction of the image area. Holes larger
 # than this are real objects sitting on/in the surface (a table on the floor, a
@@ -198,40 +238,6 @@ HOLE_FILL_FRAC = {
     "window": 0.004,
 }
 
-# --- SAM backend -------------------------------------------------------------
-# SAM 3 runs through ULTRALYTICS, not through transformers or Meta's sam3 repo.
-#
-# That choice buys back the prompts. Meta's own image API (and the transformers
-# Sam3Model/Sam3Processor wrapper) exposes a text concept prompt and BOX EXEMPLARS only
-# — no points, no dense mask prompt, no multimask — so going that way would have meant
-# throwing away most of what this pipeline prompts SAM with. Ultralytics ships a
-# SAM2-compatible visual-prompt predictor for SAM 3 whose contract is
-#   inference(im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False)
-# which is exactly the prompt set the SAM-HQ path used, low-res 256px mask included.
-# So the mask logic below is untouched and the adapter is close to a pass-through.
-#
-# It also avoids a transformers major-version bump: SAM 3 in transformers needs v5, and
-# OneFormer, BiRefNet (trust_remote_code) and Depth-Anything all ride on transformers
-# too. Going through Ultralytics keeps SAM 3 off that dependency entirely.
-#
-# Weights are NOT auto-downloaded — download sam3.pt with your approved Hugging Face
-# access and put it beside sam_hq_vit_b.pth, or point SAM3_WEIGHTS at it. Ultralytics'
-# CLIP extra is only needed for TEXT prompts; this pipeline uses visual prompts, so that
-# install step (a common source of dependency conflicts) is not needed.
-SAM_BACKEND = os.getenv("SAM_BACKEND", "sam3").strip().lower()
-SAM3_WEIGHTS = os.getenv("SAM3_WEIGHTS", "sam3.pt")
-
-# Encoder input size. Ultralytics' own default is 640 and it rounds up to a multiple of
-# the ViT stride (14), so 640 -> 644 and 1024 -> 1036. Cost is quadratic in tokens:
-# (1036/14)^2 = 5476 tokens against (644/14)^2 = 2116, so 1024 costs 2.6x the activation
-# memory of 640 for the same picture. On a 14.5GB T4 that difference is the difference
-# between running and not.
-SAM3_IMGSZ = int(os.getenv("SAM3_IMGSZ", "640"))
-
-# fp16 weights and activations. Ultralytics spells this `quantize=16` (it replaced the
-# older `half` arg) and their own SAM 3 examples pass it. Roughly halves encoder memory.
-SAM3_QUANTIZE = os.getenv("SAM3_QUANTIZE", "16").strip()
-
 DEBUG_SEG = True
 _DEBUG_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Debugs", "Masks")
 _DEBUG_MASK_DIR = os.path.normpath(_DEBUG_MASK_DIR)
@@ -240,92 +246,16 @@ try:
 except Exception:
     pass
 
-
 def load_models_if_needed():
-    global _models_loaded, processor, segmenter, sam_predictor
+    global _models_loaded, sam_predictor
     if _models_loaded: return
 
-    print(f"➡ [INFO] Loading OneFormer to {device.upper()}...")
-    from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
+    load_oneformer_if_needed()
 
-    # Load OneFormer.
-    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
-    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
+    print(f"➡ [INFO] Loading SAM to {device.upper()}...")
+    from segment_anything_hq import sam_model_registry, SamPredictor # type:ignore
 
-    sam_predictor = None
-    if SAM_BACKEND == "sam3":
-        try:
-            sam_predictor = _load_sam3()
-        except Exception as e:
-            print(f"⚠ [WARN] SAM 3 unavailable ({e}).")
-            print(f"⚠ [WARN] Check that {SAM3_WEIGHTS} exists and that ultralytics is "
-                  "up to date. Falling back to SAM-HQ for this run.")
-    if sam_predictor is None:
-        sam_predictor = _load_sam_hq()
-
-    print("✅ [SUCCESS] All Models Loaded Successfully!")
-    _models_loaded = True
-
-def _load_sam3():
-    """SAM 3 via Ultralytics' visual-prompt predictor, wrapped in _Sam3Adapter."""
-    print(f"➡ [INFO] Loading SAM 3 ({SAM3_WEIGHTS}) via Ultralytics to {device.upper()}...")
-    if not os.path.exists(SAM3_WEIGHTS):
-        raise FileNotFoundError(
-            f"{SAM3_WEIGHTS} not found. Ultralytics does not auto-download SAM 3 — "
-            "fetch it with your approved Hugging Face access, or set SAM3_WEIGHTS.")
-    try:
-        import ultralytics  # type:ignore
-        from ultralytics.models import sam as _usam  # type:ignore
-    except ImportError as e:
-        raise ImportError("ultralytics is not installed; pip install -U ultralytics") from e
-
-    # SAM3Predictor is the SAM2-compatible VISUAL-prompt class. SAM3SemanticPredictor is
-    # the text/concept one and accepts no points, so it is deliberately not used here.
-    cls = getattr(_usam, "SAM3Predictor", None)
-    if cls is None:
-        raise ImportError(
-            f"ultralytics {getattr(ultralytics, '__version__', '?')} has no SAM3Predictor; "
-            "pip install -U ultralytics")
-
-    overrides = {
-        "model": SAM3_WEIGHTS, "task": "segment", "mode": "predict",
-        "imgsz": SAM3_IMGSZ, "conf": 0.25, "save": False, "verbose": False,
-        "device": device,
-    }
-    if SAM3_QUANTIZE in ("16", "fp16"):
-        overrides["quantize"] = 16
-    predictor = cls(overrides=overrides)
-
-    # DISABLE torch.compile. This is the fix for the CUDA OOM on a T4, and it has to be
-    # done here rather than through overrides because of an Ultralytics bug:
-    #
-    #   cfg/default.yaml   compile: False        # documented as "False=off"
-    #   SAM3Predictor.get_model()                build_interactive_sam3(..., compile=self.args.compile)
-    #   sam3/encoder.py    if compile_mode is not None: torch.compile(self.forward, ...)
-    #
-    # `False is not None` is True, so the documented "off" value still compiles the
-    # vision backbone through inductor — the traceback ran through _dynamo/aot_autograd
-    # and logged "Not enough SMs to use max_autotune_gemm mode" before dying. Inductor's
-    # autotuning workspace is what exhausted the 14.5GB card: OneFormer had already been
-    # moved to CPU and the cache emptied, and SAM 3 alone still held 14.3GB.
-    #
-    # Passing compile=None through overrides does not work either — their validator
-    # rejects it outright ("'compile=None' is invalid. 'compile' must not be None"). So
-    # set it after cfg validation and before get_model() reads it.
-    try:
-        predictor.args.compile = None
-    except Exception:
-        print("⚠ [WARN] Could not disable torch.compile for SAM 3; expect high VRAM use.")
-
-    predictor.setup_model()
-    print(f"✅ [INFO] SAM 3 loaded (Ultralytics visual-prompt predictor, imgsz={SAM3_IMGSZ}, "
-          f"quantize={overrides.get('quantize', 32)}, torch.compile=off).")
-    return _Sam3Adapter(predictor)
-
-def _load_sam_hq():
-    """SAM-HQ ViT-B — the previous backend, kept as the fallback."""
-    print(f"➡ [INFO] Loading SAM-HQ (vit_b) to {device.upper()}...")
-    from segment_anything_hq import sam_model_registry, SamPredictor  # type:ignore
+    # Load SAM-HQ (ViT-B)
     sam_checkpoint = "sam_hq_vit_b.pth"
     model_type = "vit_b"
     _orig_load = torch.load
@@ -335,8 +265,24 @@ def _load_sam_hq():
     finally:
         torch.load = _orig_load
     sam.to(device=device)
-    print("✅ [INFO] SAM-HQ loaded.")
-    return SamPredictor(sam)
+    sam_predictor = SamPredictor(sam)
+
+    print("✅ [SUCCESS] All Models Loaded Successfully!")
+    _models_loaded = True
+
+def load_oneformer_if_needed():
+    """OneFormer only. Split out from the SAM load so callers that just need
+    panoptic labels — reference-object detection — do not also have to have the
+    2.4 GB SAM checkpoint present."""
+    global processor, segmenter
+    if segmenter is not None: return
+
+    print(f"➡ [INFO] Loading OneFormer to {device.upper()}...")
+    from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
+
+    processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
+    segmenter = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").to(device)
+    print("✅ [SUCCESS] OneFormer loaded.")
 
 # Depth Anything V2 (metric, indoor) — reconstructs the floor PLANE so the rug
 # visualizer gets a perspective-correct floor quad. Loaded lazily on first use.
@@ -659,131 +605,6 @@ def sample_positive_points(of_bool, bbox, max_points=8):
             uniq.append([px, py])
     return uniq[:max_points]
 
-class _Sam3Adapter:
-    """Presents Ultralytics' SAM 3 through the calls this pipeline makes of a predictor.
-
-    Ultralytics' SAM predictors already work the way SamPredictor did: set_image()
-    encodes once and stores the features, then each prompt call runs only the prompt
-    encoder and mask decoder. This pipeline prompts once per surface plus once per solid
-    occluder, so that caching is what keeps the cost sane.
-    """
-
-    def __init__(self, predictor):
-        self.p = predictor
-        self._hw = None
-
-    def set_image(self, image_rgb):
-        # Ultralytics documents set_image as taking "a numpy array representing an image
-        # read by cv2" — i.e. BGR. The pipeline hands us RGB (it was feeding SAM-HQ,
-        # which wanted RGB), so convert here rather than change the call site.
-        self._hw = image_rgb.shape[:2]
-        bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        try:
-            self.p.reset_image()
-        except Exception:
-            pass
-        try:
-            self.p.set_image(bgr)
-            return
-        except torch.cuda.OutOfMemoryError:
-            pass
-        # An OOM here used to take the whole service down: the failed allocation stayed
-        # resident, so every later request died instantly at the same place (observed —
-        # a follow-up request OOMed after 2.2s with 14.35GB still allocated). Release it
-        # and retry once at a smaller encoder size before giving up.
-        print("⚠ [WARN] SAM 3 ran out of VRAM at "
-              f"imgsz={SAM3_IMGSZ}; clearing cache and retrying smaller.")
-        try:
-            self.p.reset_image()
-        except Exception:
-            pass
-        torch.cuda.empty_cache()
-        try:
-            self.p.args.imgsz = max(378, int(SAM3_IMGSZ * 0.625))
-            self.p.set_image(bgr)
-            print(f"➡ [INFO] SAM 3 recovered at imgsz={self.p.args.imgsz}.")
-        except Exception:
-            torch.cuda.empty_cache()
-            raise
-
-    def _empty(self):
-        h, w = self._hw
-        return np.zeros((1, h, w), dtype=bool), np.zeros((1,), np.float32), None
-
-    def predict(self, points, labels, box, mask_input):
-        """Return (masks, scores, None) with masks (N, H, W) bool — the same contract
-        SamPredictor.predict had, so _best_iou_index needs no change."""
-        h, w = self._hw
-        bboxes = None
-        if box is not None:
-            b = np.asarray(box).reshape(-1).tolist()
-            bboxes = [[float(b[0]), float(b[1]), float(b[2]), float(b[3])]]
-        # ONE prompt carrying N points, not N prompts of one point each. Ultralytics reads
-        #   points (N, 2)            -> N SEPARATE prompts, one point apiece
-        #   points (N, num_points, 2) -> N prompts with num_points each
-        # and SAM-HQ's predict() meant the first shape to be a single multi-point prompt.
-        # Passing the flat shape made every point its own prompt while the box stayed a
-        # batch of one, so the prompt encoder tried to concatenate batch 1 against batch
-        # N and raised "Sizes of tensors must match except in dimension 1. Expected size 1
-        # but got size 8". The 4/6/7/8 in those messages were literally the point counts
-        # from sample_positive_points. Wrapping in a leading axis keeps the batch at 1.
-        pts = lbs = None
-        if points:
-            pts = [np.asarray(points, dtype=np.float32).reshape(-1, 2).tolist()]
-            if labels:
-                lbs = [np.asarray(labels, dtype=np.int32).reshape(-1).tolist()]
-
-        def _call(**kw):
-            res = self.p(bboxes=bboxes, points=pts, labels=lbs, **kw)
-            return res[0] if isinstance(res, (list, tuple)) else res
-
-        # The mask prompt has to be RE-EXPRESSED, not forwarded. SAM-HQ took a 256x256
-        # map of +-8 logits (what mask_to_sam_logits builds); Ultralytics wants a
-        # FULL-RESOLUTION BINARY mask, because _prepare_prompts does
-        #     masks = np.asarray(masks, dtype=np.uint8)
-        #     masks = np.stack([LetterBox(dst_shape, interpolation=INTER_NEAREST)(image=x) ...])
-        # Handing it the logits would fail silently in the worst way: the uint8 cast wraps
-        # -8.0 to 248, so every background pixel arrives as a strong POSITIVE, and a
-        # 256x256 array would then be letterboxed as though it were the whole image.
-        # Thresholding at 0 and resizing to the image recovers the intended prompt; the
-        # only thing lost is the 256px quantisation, which SAM-HQ imposed anyway.
-        mask_prompt = None
-        if mask_input is not None:
-            try:
-                mi = np.asarray(mask_input, dtype=np.float32)
-                mi = mi.reshape(-1, *mi.shape[-2:])[0]
-                mask_prompt = cv2.resize((mi > 0).astype(np.uint8), (w, h),
-                                         interpolation=cv2.INTER_NEAREST)[None]
-            except Exception:
-                mask_prompt = None
-
-        # The same graceful degradation the SAM-HQ path used: drop the dense mask prompt,
-        # then the multimask flag, rather than lose the prediction to a kwarg mismatch.
-        try:
-            r = _call(masks=mask_prompt, multimask_output=True)
-        except Exception:
-            try:
-                r = _call(multimask_output=True)
-            except Exception:
-                r = _call()
-
-        m = getattr(r, "masks", None)
-        data = getattr(m, "data", None) if m is not None else None
-        if data is None or len(data) == 0:
-            return self._empty()
-        arr = data.detach().cpu().numpy() if hasattr(data, "detach") else np.asarray(data)
-        arr = arr.reshape(-1, *arr.shape[-2:])
-        arr = arr > 0.5 if arr.dtype != bool else arr
-        if arr.shape[-2:] != (h, w):
-            arr = np.stack([cv2.resize(a.astype(np.uint8), (w, h),
-                                       interpolation=cv2.INTER_NEAREST) > 0 for a in arr])
-        if not len(arr):
-            return self._empty()
-        conf = getattr(getattr(r, "boxes", None), "conf", None)
-        sc = (conf.detach().cpu().numpy() if hasattr(conf, "detach")
-              else np.ones(len(arr), np.float32))
-        return arr, sc, None
-
 def mask_to_sam_logits(of_bool, size=256, val=8.0):
     """Encode a binary mask as SAM low-res mask_input logits (fg=+val, bg=-val)."""
     small = cv2.resize(of_bool.astype(np.float32), (size, size), interpolation=cv2.INTER_LINEAR)
@@ -791,15 +612,7 @@ def mask_to_sam_logits(of_bool, size=256, val=8.0):
     return logits[None, :, :].astype(np.float32)
 
 def _sam_predict_safe(predictor, points, labels, box, mask_input):
-    """Call SAM with graceful degradation if a kwarg combination is rejected.
-
-    Backend-agnostic: SAM 3 takes the same (points, labels, box) and returns the same
-    (masks, scores, logits) triple, so both call sites and everything around them are
-    identical whichever model is loaded, mask_input included — Ultralytics' SAM 3
-    visual-prompt predictor takes the same 256px low-res mask prompt SAM-HQ did.
-    """
-    if isinstance(predictor, _Sam3Adapter):
-        return predictor.predict(points, labels, box, mask_input)
+    """Call SAM with graceful degradation if a kwarg combination is rejected."""
     pc = np.array(points) if points else None
     pl = np.array(labels) if labels else None
     try:
@@ -1033,7 +846,8 @@ def occluders_in_front_of(occluder_union, surface_uint8, labelled_bool=None,
 def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_map,
                  occluder_seg_ids, image_area, ownership_min=VOID_OWNERSHIP_MIN,
                  max_inradius_frac=VOID_MAX_INRADIUS_FRAC,
-                 min_pocket_px=VOID_MIN_POCKET_PX):
+                 min_pocket_px=VOID_MIN_POCKET_PX,
+                 halo_reach_frac=HALO_REACH_FRAC):
     """FILL ONCE: complete interior fill of the surface, protecting real openings.
 
     The occluders in front of the surface are part of the flood BARRIER while the extent
@@ -1045,10 +859,17 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
     it is an enclosed hole of the barrier, so a single fill recovers all of it. No
     footprint refill, no halo growth, no distance caps.
 
-    A pocket must clear three independent gates before this surface may claim it — see
-    the constants above for the measurements behind each. It must be big enough to be a
-    halo at all, it must be OWNED by this surface rather than shared with another, and it
-    must be THIN enough to be a shell rather than a solid object.
+    A pocket must clear three independent gates before this surface may claim it WHOLE —
+    see the constants above for the measurements behind each. It must be big enough to be
+    a halo at all, it must be OWNED by this surface rather than shared with another, and
+    it must be THIN enough to be a shell rather than a solid object.
+
+    A pocket that fails is no longer discarded outright: the band of it within
+    HALO_REACH_FRAC of an occluder in front of this surface is still filled. Without that,
+    one connected envelope running from a plant's leaf tips out into open wall fails
+    THINNESS as a whole and survives into the final mask as a hole far bigger than the
+    occluder's real silhouette — a pixel-accurate cutout wrapped in an untextured blob,
+    which is exactly what was reported on the visualiser.
 
     Windows, doors and arches need no gate of their own: they are labelled, so they are
     part of the barrier and never become holes in the first place. That also protects
@@ -1071,7 +892,8 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
     # The EXTENT, though, is only ever surface + occluder. Structural territory bounds
     # the fill; it is never claimed by it.
     out = np.maximum(surface_uint8, occ_front_uint8)
-    st = {"filled": 0, "speck": 0, "contested": 0, "too_thick": 0, "unrecognised": 0}
+    st = {"filled": 0, "halo": 0, "speck": 0, "contested": 0, "too_thick": 0,
+          "unrecognised": 0}
     if not holes.any():
         return out, st
     holes_bin = (holes > 0).astype(np.uint8)
@@ -1083,7 +905,25 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
     max_inradius = max(4.0, max_inradius_frac * float(max(h, w)))
     surf_bool = surface_uint8 > 127
     rival_bool = structural_uint8 > 127
+    occ_bool = occ_front_uint8 > 127
     k3 = np.ones((3, 3), np.uint8)
+
+    # The SHELL: within `halo_reach` of an occluder in front of this surface, OR within
+    # reach of the surface itself. A halo is bounded by both — it IS the gap between
+    # them — so measuring from one side only strands a residual ring in the middle of a
+    # thick envelope, which is the same blob in miniature. What stays refused is a
+    # pocket's deep CORE, far from both: the solid unlabelled object the thinness gate
+    # exists to protect, now judged per pixel instead of per pocket. Set HALO_REACH_FRAC
+    # to 0 to disable the partial fill and restore the previous behaviour exactly.
+    halo_reach = halo_reach_frac * float(max(h, w))
+    if occ_bool.any() and halo_reach >= 1.0:
+        shell = ((cv2.distanceTransform((~occ_bool).astype(np.uint8),
+                                        cv2.DIST_L2, 3) <= halo_reach)
+                 | (cv2.distanceTransform((~surf_bool).astype(np.uint8),
+                                          cv2.DIST_L2, 3) <= halo_reach))
+    else:
+        shell = np.zeros((h, w), bool)
+
     for i in range(1, num):
         area = int(cc_stats[i, cv2.CC_STAT_AREA])
         if area < min_pocket_px:
@@ -1097,28 +937,47 @@ def heal_surface(surface_uint8, occ_front_uint8, structural_uint8, segmentation_
         y1 = min(h, y0 + int(cc_stats[i, cv2.CC_STAT_HEIGHT]) + 4)
         sub = labels[y0:y1, x0:x1] == i
 
-        # THINNESS — a shell, or a solid object?
-        if float(dt[y0:y1, x0:x1][sub].max()) > max_inradius:
-            st["too_thick"] += 1
-            continue
+        # Every measurement for this pocket, taken once. The gates below decide
+        # between a WHOLE fill, a partial halo fill, and nothing.
+        thin = float(dt[y0:y1, x0:x1][sub].max()) <= max_inradius
 
         # OWNERSHIP — among the surfaces bordering this pocket, is this one dominant?
         ring = cv2.dilate(sub.astype(np.uint8), k3).astype(bool) & ~sub
         own = int((ring & surf_bool[y0:y1, x0:x1]).sum())
         rival = int((ring & rival_bool[y0:y1, x0:x1]).sum())
-        if own + rival == 0 or own / float(own + rival) < ownership_min:
-            st["contested"] += 1
-            continue
+        owned = (own + rival) > 0 and own / float(own + rival) >= ownership_min
 
         # Label safety: only void, or an occluder that gets cut anyway, may be taken.
         vals, counts = np.unique(segmentation_map[y0:y1, x0:x1][sub], return_counts=True)
         dominant = int(vals[int(np.argmax(counts))])
-        if dominant != 0 and dominant not in occluder_seg_ids:
-            st["unrecognised"] += 1
+        label_safe = dominant == 0 or dominant in occluder_seg_ids
+
+        if thin and owned and label_safe:
+            out[y0:y1, x0:x1][sub] = 255
+            st["filled"] += 1
             continue
 
-        out[y0:y1, x0:x1][sub] = 255
-        st["filled"] += 1
+        # PARTIAL HALO FILL. The pocket failed as a whole — nearly always THINNESS,
+        # because one connected envelope runs from the leaf tips out into open wall —
+        # but the band of it hugging the occluder is still that occluder's halo, and
+        # refusing it is what leaves a hole many times the size of the silhouette the
+        # matte actually produced. Take only that band, and only when this surface is
+        # the pocket's dominant neighbour, so a void fringe on a wall/curtain seam
+        # still belongs to nobody. Anything of the band that is genuinely the object is
+        # removed again by the cut.
+        if label_safe and own > rival and (ring & occ_bool[y0:y1, x0:x1]).any():
+            band = sub & shell[y0:y1, x0:x1]
+            if band.any():
+                out[y0:y1, x0:x1][band] = 255
+                st["halo"] += 1
+                continue
+
+        if not thin:
+            st["too_thick"] += 1
+        elif not owned:
+            st["contested"] += 1
+        else:
+            st["unrecognised"] += 1
     return out, st
 
 def refine_boundary_scoped(mask_uint8, image_bgr, occluder_union, guard_frac=0.004):
@@ -1183,6 +1042,126 @@ def postprocess_mask(mask_uint8, image_bgr, image_area, do_edge_refine=True,
     if do_edge_refine:
         mask_uint8 = refine_mask_edges(mask_uint8, image_bgr)
     return mask_uint8
+
+def fill_void_gaps_in_hull(binary_uint8, segmentation_map, segments_info=None, id2label=None,
+                            min_hole_frac=0.003, void_fill_thresh=0.5, poly_epsilon_frac=0.01):
+    """Fills gaps inside a segment's own convex hull that are mostly VOID
+    (segmentation_map == 0 there - OneFormer assigned no confident label at
+    all; real segment ids count up from 1, so 0 is void) rather than a
+    genuinely different labeled segment.
+
+    OneFormer's panoptic map isn't guaranteed to assign a class to every
+    pixel - reflections/glare on glass routinely leave scattered patches
+    with no label at all, even though they're visually still part of the
+    same window/door. Everything downstream that trusts "not part of this
+    segment" as "there's a real object here" (prepare_window_inpaint_mask's
+    hole preservation, in particular) was treating those labeling gaps as
+    protected occluder holes, which is why a heavily-reflective glass door
+    could come out looking like torn paper - confirmed by cross-referencing
+    the oneformer_labels debug overlay, where the same scattered dark
+    patches sit inside the door/window's own colored region.
+
+    A real occluder (something OneFormer DID confidently label as a
+    different class - a bench, a sofa) is left excluded exactly as before;
+    only pure labeling noise gets filled back in as part of this surface. A
+    gap too small to matter either way (hull/polygon-fit smoothing noise)
+    is filled regardless of what's under it, same as
+    prepare_window_inpaint_mask's equivalent threshold.
+
+    A second, narrower case is also handled when segments_info/id2label are
+    given: a gap that ISN'T void but whose dominant label is in
+    REPAINTABLE_OCCLUDER_LABELS, e.g. OneFormer labeling a reflective glass
+    mullion "wall" instead of "windowpane", is trusted to be a mislabeled
+    part of the SAME surface (an embedded frame/mullion) rather than a real
+    foreground occluder, and gets filled too. This is deliberately an
+    allowlist of what's safe to repaint (a handful of flat/architectural
+    classes), not a blocklist of furniture - ADE20K has ~150 classes and a
+    blocklist would always be one missed class away from silently painting
+    curtain fabric over a real object.
+
+    (An earlier version of this also gated on the gap being a true
+    RETR_CCOMP-enclosed interior island - fully surrounded by this
+    surface's own pixels, never touching its true outer silhouette -
+    reasoning that a chair/sofa occluder bites in from the true outer edge
+    while an embedded mullion wouldn't. Dropped: in practice a mullion void
+    commonly runs up to the window's own top/side frame line, so it reads
+    as boundary-touching too, and the enclosure check blocked the exact
+    case it was meant to allow. interior_frac is still computed and logged
+    for visibility, just no longer gates the decision - the label allowlist
+    alone is trusted to be narrow enough not to need it.)
+    """
+    h, w = binary_uint8.shape[:2]
+    _, binary = cv2.threshold(binary_uint8, 127, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return binary_uint8
+    outer = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(outer)
+    epsilon = poly_epsilon_frac * cv2.arcLength(hull, True)
+    hull_poly = cv2.approxPolyDP(hull, epsilon, True)
+
+    filled = np.zeros_like(binary)
+    cv2.drawContours(filled, [hull_poly], -1, 255, thickness=cv2.FILLED)
+
+    hull_area = max(1, int(cv2.contourArea(hull_poly)))
+    min_gap_area = max(50, int(min_hole_frac * hull_area))
+
+    candidate_gaps = cv2.bitwise_and(filled, cv2.bitwise_not(binary))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_gaps, connectivity=8)
+
+    # True topological holes of the RAW mask itself (RETR_CCOMP's "has a
+    # parent" contours) - fully enclosed by this surface's own pixels, never
+    # reaching its true outer boundary. Only used below as the interior-vs-edge
+    # signal, never on its own.
+    raw_contours, raw_hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    true_holes = np.zeros_like(binary)
+    if raw_hierarchy is not None:
+        for idx, hinfo in enumerate(raw_hierarchy[0]):
+            if hinfo[3] != -1:  # has a parent contour -> genuinely enclosed hole
+                cv2.drawContours(true_holes, raw_contours, idx, 255, thickness=cv2.FILLED)
+
+    id_to_label = {}
+    if segments_info is not None and id2label is not None:
+        for seg in segments_info:
+            id_to_label[seg["id"]] = get_label_from_id(id2label, seg["label_id"])
+
+    # OneFormer's void sentinel is 0 (real ids start at 1) - see the VOID IS 0
+    # note in process_scene_pipeline's structural-territory comment.
+    is_void = (segmentation_map == 0)
+    result = binary.copy()
+    for i in range(1, num):
+        comp_mask = (labels == i)
+        if stats[i, cv2.CC_STAT_AREA] < min_gap_area:
+            result[comp_mask] = 255  # too small to be a real object either way
+            continue
+        void_frac = float(is_void[comp_mask].mean())
+
+        if void_frac >= void_fill_thresh:
+            if DEBUG_SEG:
+                print(f"[DEBUG] fill_void_gaps_in_hull: component {i} area={int(stats[i, cv2.CC_STAT_AREA])} "
+                      f"void_frac={void_frac:.2f} -> filled (void)", flush=True)
+            result[comp_mask] = 255  # mostly unlabeled - OneFormer's own gap, not a real object
+            continue
+
+        interior_frac = float((true_holes[comp_mask] > 0).mean())  # diagnostic only, not gated on
+        ids, counts = np.unique(segmentation_map[comp_mask], return_counts=True)
+        top_id = int(ids[np.argmax(counts)])
+        dominant_label = id_to_label.get(top_id)
+        is_repaintable = dominant_label in REPAINTABLE_OCCLUDER_LABELS
+
+        if DEBUG_SEG:
+            top = sorted(zip(ids.tolist(), counts.tolist()), key=lambda t: -t[1])[:5]
+            print(f"[DEBUG] fill_void_gaps_in_hull: component {i} area={int(stats[i, cv2.CC_STAT_AREA])} "
+                  f"void_frac={void_frac:.2f} interior_frac={interior_frac:.2f} "
+                  f"dominant_label={dominant_label!r} top_segment_ids={top} "
+                  f"-> {'filled (repaintable label)' if is_repaintable else 'excluded (real occluder)'}", flush=True)
+
+        if is_repaintable:
+            result[comp_mask] = 255
+        # else: a real foreground occluder, stays excluded.
+
+    return result
 
 def build_straighten_zone(arch_all_uint8, own_bool, occluder_union, shape,
                           reach_frac=STRAIGHTEN_REACH_FRAC):
@@ -1269,6 +1248,246 @@ def rasterise_at_render_res(mask_uint8, target=RENDER_MAX_DIM, aa_px=AA_RENDER_P
     alpha = np.clip(0.5 + big / max(1e-6, float(aa_px)), 0.0, 1.0)
     return (alpha * 255.0 + 0.5).astype(np.uint8)
 
+
+# Scale-reference objects. The real-world sizes live in
+# utils/rugs.REFERENCE_OBJECTS; this only maps those names onto ADE20k labels.
+# Matching is exact-token (label_matches), so "chair" also picks up
+# "swivel chair" and "armchair" picks up itself, without substring accidents.
+REFERENCE_LABELS = {
+    "bed": {"bed"},
+    "chair": {"chair", "armchair"},
+    "door": {"door"},
+}
+REFERENCE_MIN_AREA = 0.004   # ignore references under 0.4% of the frame
+
+
+def detect_reference_objects(image_cv2, max_dim=1280, min_area_frac=REFERENCE_MIN_AREA):
+    """Find known-size objects (bed / chair / door) for depth-scale calibration."""
+    load_oneformer_if_needed()   # SAM is not needed for label-only detection
+
+    H0, W0 = image_cv2.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(H0, W0)))
+
+    if scale < 1.0:
+        proc = cv2.resize(image_cv2, (max(1, int(W0 * scale)), max(1, int(H0 * scale))),interpolation=cv2.INTER_AREA)
+    else:
+        proc = image_cv2
+
+    pil_image = Image.fromarray(cv2.cvtColor(proc, cv2.COLOR_BGR2RGB))
+    inputs = processor(images=pil_image, task_inputs=["panoptic"], return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = segmenter(**inputs)
+    result = processor.post_process_panoptic_segmentation(
+        outputs, target_sizes=[pil_image.size[::-1]]
+    )[0]
+
+    seg_map = result["segmentation"].cpu().numpy()
+    id2label = segmenter.config.id2label
+    proc_area = float(seg_map.shape[0] * seg_map.shape[1])
+
+    found = []
+    for segment in result["segments_info"]:
+        model_label = get_label_from_id(id2label, segment["label_id"])
+        canonical = None
+        for name, keywords in REFERENCE_LABELS.items():
+            if label_matches(model_label, keywords):
+                canonical = name
+                break
+        if canonical is None:
+            continue
+
+        seg_bool = (seg_map == segment["id"])
+        area_frac = float(seg_bool.sum()) / proc_area
+        if area_frac < min_area_frac:
+            continue
+
+        rows, cols = np.where(seg_bool)
+        mask = seg_bool.astype(np.uint8) * 255
+        if scale < 1.0:
+            mask = cv2.resize(mask, (W0, H0), interpolation=cv2.INTER_NEAREST)
+
+        found.append({
+            "label": canonical,
+            "ade_label": model_label,
+            "mask": mask,
+            "bbox": [int(cols.min() / scale), int(rows.min() / scale),
+                     int(cols.max() / scale), int(rows.max() / scale)],
+            "area_frac": round(area_frac, 5),
+        })
+
+    summary = ", ".join("{0} ({1})".format(d["label"], d["ade_label"]) for d in found)
+    print("➡ [REFERENCE] Detected {0} scale reference(s): {1}".format(
+        len(found), summary or "none"))
+    return found
+
+def prepare_window_inpaint_mask(mask_uint8, margin_frac=0.05, poly_epsilon_frac=0.01, min_hole_frac=0.003):
+    """Turns a window's segmentation mask into one suited for the Flux
+    inpaint pipeline (curtain generation), rather than for display/cropping:
+
+    1. Straightens EoMT's boundary via a CONVEX HULL, not approxPolyDP
+       directly on the raw contour. A hull mathematically bridges over any
+       concave notch - which is exactly what an occluder sitting at the
+       sill or against the frame carves into the boundary - while an object
+       sitting fully inside the window (never touching its edge) stays a
+       separate enclosed hole, untouched by the hull either way. Using
+       approxPolyDP directly on the raw (notched) contour was tried first
+       and rejected: a notch that reaches deep enough pulls the SIMPLIFIED
+       edge line up with it (there's no way to tell "real notch" from
+       "boundary jaggedness" from the polygon-fit's perspective alone), so
+       the recovered hole below only ever showed the small tip of the
+       object poking above that pulled-in line, losing most of its real
+       footprint - confirmed on a sofa/plant sitting at a windowsill, where
+       the recovered hole was a tiny sliver instead of the object's actual
+       silhouette.
+    2. Preserves any occluder sitting in/at the window (a lamp, plant, or -
+       most commonly - something on the windowsill) so the curtain gets
+       generated to appear BEHIND it, not painted over it. Detected as a
+       plain set difference - filled hull MINUS the original mask - which
+       catches a fully-enclosed hole and a boundary-touching notch the same
+       way, now that the hull (not a notch-blind polygon fit) defines what
+       "filled" means. Area-filtered against min_hole_frac (of the window's
+       own area) to tell an actual object apart from a thin sliver of
+       edge-smoothing noise the hull+polyDP pass produces incidentally.
+    3. Dilates the OUTER boundary outward so the model gets margin beyond
+       the exact opening to blend fabric into - small by design: a window
+       already fills most of its own bbox, so this is deliberately a light
+       frame-blending margin, not a big context crop.
+
+    diffusers binarizes the mask before it ever reaches the model
+    (do_binarize=True), so this only needs to be a clean hard edge, not a
+    feathered one - any softness passed in here would be thrown away.
+
+    Assumes a roughly rectangular/quadrilateral window (true even in
+    perspective) - a window whose segment is oddly shaped from heavy partial
+    occlusion may get clipped by the polygon fit.
+    """
+    h, w = mask_uint8.shape[:2]
+    _, binary = cv2.threshold(mask_uint8, 127, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask_uint8
+    outer = max(contours, key=cv2.contourArea)
+
+    hull = cv2.convexHull(outer)
+    epsilon = poly_epsilon_frac * cv2.arcLength(hull, True)
+    outer_poly = cv2.approxPolyDP(hull, epsilon, True)
+
+    filled = np.zeros_like(binary)
+    cv2.drawContours(filled, [outer_poly], -1, 255, thickness=cv2.FILLED)
+
+    window_area = max(1, int(cv2.contourArea(outer_poly)))
+    min_hole_area = max(50, int(min_hole_frac * window_area))
+    candidate_holes = cv2.bitwise_and(filled, cv2.bitwise_not(binary))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_holes, connectivity=8)
+    holes = np.zeros_like(binary)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_hole_area:
+            holes[labels == i] = 255
+
+    clean = cv2.bitwise_and(filled, cv2.bitwise_not(holes))
+
+    bx, by, bw, bh = cv2.boundingRect(outer_poly)
+    dx = max(2, int(margin_frac * bw))
+    dy = max(2, int(margin_frac * bh))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dx + 1, 2 * dy + 1))
+    dilated = cv2.dilate(clean, kernel)
+
+    # Re-punch the holes after dilation - dilate() grows the white region
+    # into ANY adjacent black region, including a hole's own boundary, so a
+    # hole smaller than the dilation kernel can otherwise get filled back in.
+    dilated = cv2.bitwise_and(dilated, cv2.bitwise_not(holes))
+
+    return dilated
+
+def merge_adjacent_instance_segments(segmentation_map, segments_info, target_ids, labels_to_merge=("window",), gap_px=None):
+    """Merges same-label panoptic instances that are only a mullion/frame's
+    width apart back into one segment, in place.
+
+    OneFormer treats classes like "window" as instances rather than EoMT's
+    single merged "stuff" blob, so one physical multi-pane window (e.g. a
+    3-column x 2-row grid split by mullions) comes back as N separate
+    segment ids - one hotspot per pane instead of one for the whole unit.
+    Two same-label segments are merged if dilating one by gap_px makes it
+    touch the other, which bridges the thin mullion gap between panes
+    without merging genuinely separate windows (those stay far enough apart
+    that the dilation never reaches).
+
+    The mullion strip itself was never claimed by any window segment (it's
+    unlabeled or a different class), so relabeling the segments alone still
+    leaves a thin excluded seam between panes - fine for the "_3_final"
+    debug dump (which starts from the full raw binary and only ever adds
+    pixels), but prepare_window_inpaint_mask's single-largest-contour hull
+    then picks whichever pane cluster is biggest and silently drops every
+    other disconnected pane. So the gap is closed for real: a morphological
+    CLOSE of each merged pair's combined mask, and any pixel that closing
+    adds within the merge is claimed for keep_id too - a curtain is meant to
+    cover the whole frame including its mullions anyway.
+    """
+    h, w = segmentation_map.shape[:2]
+    if gap_px is None:
+        # Mullion/frame width between panes runs noticeably wider than plain
+        # boundary noise (measured 10-17px on an 807px-tall test photo) -
+        # a 1% radius was too small to bridge it. 2.5% with an 18px floor
+        # closes real mullion gaps while staying below genuinely separate
+        # windows (measured 21px+ apart on the same photo).
+        gap_px = max(18, int(0.025 * max(h, w)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gap_px + 1, 2 * gap_px + 1))
+
+    for label_name in labels_to_merge:
+        ids_for_label = target_ids.get(label_name, set())
+        segs = [s for s in segments_info if s["label_id"] in ids_for_label]
+        if len(segs) < 2:
+            continue
+
+        parent = {s["id"]: s["id"] for s in segs}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        raw_masks = {s["id"]: (segmentation_map == s["id"]) for s in segs}
+        dilated_masks = {sid: cv2.dilate(m.astype(np.uint8), kernel) for sid, m in raw_masks.items()}
+
+        for i in range(len(segs)):
+            for j in range(i + 1, len(segs)):
+                a, b = segs[i]["id"], segs[j]["id"]
+                if np.any((dilated_masks[a] > 0) & raw_masks[b]):
+                    union(a, b)
+
+        groups = {}
+        for s in segs:
+            groups.setdefault(find(s["id"]), []).append(s["id"])
+
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            keep_id = min(members)
+            drop_ids = [m for m in members if m != keep_id]
+
+            combined = np.zeros((h, w), dtype=np.uint8)
+            for m in members:
+                combined |= raw_masks[m].astype(np.uint8)
+            closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+            gap_fill = (closed > 0) & (combined == 0)
+            segmentation_map[gap_fill] = keep_id
+
+            for drop_id in drop_ids:
+                segmentation_map[segmentation_map == drop_id] = keep_id
+            if DEBUG_SEG:
+                print(f"[DEBUG] merge_adjacent_instance_segments: merged {label_name} segments "
+                      f"{drop_ids} into {keep_id} (closed {int(gap_fill.sum())} mullion px)", flush=True)
+            segments_info[:] = [s for s in segments_info if s["id"] not in drop_ids]
+
+    return segmentation_map, segments_info
+
 def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, masks_folder: str, generated_folder: str, server_base_url: str):
     
     load_models_if_needed() # Ensure models are loaded
@@ -1276,7 +1495,6 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     # --- Pre-segmentation downscaling ---
     orig_width, orig_height = image.size
     MAX_SEG_DIM = 1536 
-    # MAX_SEG_DIM = 1024 
     scale_factor = 1.0
     
     if max(orig_width, orig_height) > MAX_SEG_DIM:
@@ -1291,16 +1509,10 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
     width, height = image.size
     image_area = width * height
 
-    # Ensure segmenter is on the GPU before running
-    segmenter.to(device)
-
     # Run OneFormer
     inputs = processor(images=image, task_inputs=["panoptic"], return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmenter(**inputs)
-
-    # --- NEW: Move OneFormer to CPU to free VRAM for SAM ---
-    segmenter.to("cpu")
 
     # --- Clear Cache after heavy forward pass ---
     torch.cuda.empty_cache()
@@ -1318,6 +1530,9 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
 
     # Pre-compute the ADE20k id set for each target class once (was recomputed per-segment in the original loop).
     target_ids = {ul: set(find_ade20k_id(ul, id2label)) for ul in TARGET_OBJECTS.keys()}
+
+    segmentation_map, segments_info = merge_adjacent_instance_segments(
+        segmentation_map, segments_info, target_ids)
 
     found_objects = []
     hotspots = []
@@ -1489,6 +1704,75 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                            & ~occ_labelled_bool)
         structural_uint8 = structural_bool.astype(np.uint8) * 255
 
+        # window/door take a separate, minimal path (see the seg_class in
+        # ("window", "door") branch below): SAM, structural subtraction, the
+        # scoped edge-refine, and the heal/validate machinery all assume a
+        # surface where "anything not confidently this label" means a real
+        # object. On glass that assumption breaks — reflections/glare leave
+        # scattered void patches that aren't real occluders, and running any
+        # of those steps re-carves exactly what fill_void_gaps_in_hull just
+        # decided to keep. See fill_void_gaps_in_hull's docstring.
+        if seg_class in ("window", "door"):
+            try:
+                # EXPERIMENTAL: window (and door, which OneFormer's own
+                # ADE20k taxonomy often confuses with window for a
+                # full-height glass panel - e.g. a balcony sliding door)
+                # skip SAM entirely. SAM has no semantic label awareness -
+                # it only re-traces "the nearest coherent visual boundary"
+                # around whatever region it's prompted with, and a glass
+                # pane is one of the worst prompts for that: glass
+                # reflections, blind slats, and the frame edge all sit on
+                # top of each other as equally "coherent" boundaries, so SAM
+                # latches onto the wrong one or fragments into disconnected
+                # specks that postprocess_mask's morphological CLOSE later
+                # welds onto the main mask as permanent bumps.
+                surface = fill_void_gaps_in_hull(of_uint8, segmentation_map, segments_info, id2label)
+                max_hole_frac = HOLE_FILL_FRAC.get(seg_class, DEFAULT_HOLE_FILL_FRAC)
+                # No edge-refine, no structural-territory subtraction: a
+                # mullion OneFormer mislabelled as wall/ceiling/curtain/
+                # windowpane/door was just reclaimed above via
+                # REPAINTABLE_OCCLUDER_LABELS, and either step would
+                # immediately re-cut it back out.
+                mask_uint8 = postprocess_mask(surface, image_cv, image_area,
+                                              max_hole_frac=max_hole_frac, do_edge_refine=False)
+            except Exception as e:
+                print(f"⚠ [WARN] Mask generation failed for {seg_class} ({e}); using OneFormer mask.")
+                mask_uint8 = of_uint8
+
+            if seg_class in STRAIGHTEN_CLASSES:
+                try:
+                    _zone = build_straighten_zone(arch_all, of_bool, occluder_union,
+                                                  mask_uint8.shape[:2])
+                    mask_uint8 = regularize_mask(mask_uint8, straighten_zone=_zone)
+                except Exception as _se:
+                    print(f"⚠ [WARN] Straightening failed for {seg_class} ({_se}); skipping.")
+
+            # --- Upscale mask back to original resolution ---
+            if scale_factor != 1.0:
+                mask_uint8 = cv2.resize(mask_uint8, (orig_width, orig_height), interpolation=cv2.INTER_NEAREST)
+
+            mask_img = Image.fromarray(mask_uint8)
+            mask_filename = f"mask_{room_id}_{hotspot['image_hotspots_id']}.png"
+            mask_img.save(os.path.join(masks_folder, mask_filename))
+
+            if DEBUG_SEG:
+                try:
+                    cv2.imwrite(os.path.join(_DEBUG_MASK_DIR, f"{seg_class}_{room_id}_{hotspot['image_hotspots_id']}.png"), mask_uint8)
+                except Exception:
+                    pass
+
+            if DEBUG_SEG:
+                try:
+                    inpaint_ready = prepare_window_inpaint_mask(mask_uint8)
+                    cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
+                        f"{seg_class}_{room_id}_{hotspot['image_hotspots_id']}_4_inpaint_ready.png"), inpaint_ready)
+                except Exception as _iw:
+                    print(f"⚠ [WARN] prepare_window_inpaint_mask debug dump failed ({_iw}); skipping.")
+
+            hotspot['mask_image'] = f"{server_base_url}/masks/{mask_filename}"
+            del hotspot['_seg_class']  # strip internal key before returning
+            continue
+
         try:
             # ---- 1. semantic surface ----
             if seg_class == "wall":
@@ -1520,7 +1804,8 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                                             segmentation_map, _occ_ids, image_area)
                 healed = cv2.bitwise_and(healed, cv2.bitwise_not(structural_uint8))
                 if any(_hst.values()):
-                    print(f"   [HEAL] {seg_class}: filled {_hst['filled']} void pocket(s); "
+                    print(f"   [HEAL] {seg_class}: filled {_hst['filled']} void pocket(s) whole, "
+                          f"{_hst['halo']} partially (occluder halo band); "
                           f"refused {_hst['contested']} contested / {_hst['too_thick']} too-thick / "
                           f"{_hst['unrecognised']} unrecognised / {_hst['speck']} specks")
             else:
@@ -1583,6 +1868,22 @@ def process_scene_pipeline(image: Image.Image, room_id: str, filename: str, mask
                 cv2.imwrite(os.path.join(_DEBUG_MASK_DIR, f"{seg_class}_{room_id}_{hotspot['image_hotspots_id']}.png"), mask_uint8)
             except Exception:
                 pass
+
+        # TESTING ONLY - dumps what prepare_window_inpaint_mask() would
+        # produce for this hotspot's mask right now, at /api/upload time,
+        # so it can be inspected without needing a full curtain-generation
+        # call through Flux (which isn't runnable in this dev environment).
+        # This is purely a debug artifact - the real pipeline still only
+        # ever calls prepare_window_inpaint_mask() from
+        # run_generation_pipeline(), on-demand, per curtain-generation call;
+        # hotspot['mask_image'] below is untouched, still the raw mask.
+        if DEBUG_SEG and seg_class in ("window", "door"):
+            try:
+                inpaint_ready = prepare_window_inpaint_mask(mask_uint8)
+                cv2.imwrite(os.path.join(_DEBUG_MASK_DIR,
+                    f"{seg_class}_{room_id}_{hotspot['image_hotspots_id']}_4_inpaint_ready.png"), inpaint_ready)
+            except Exception as _iw:
+                print(f"⚠ [WARN] prepare_window_inpaint_mask debug dump failed ({_iw}); skipping.")
 
         hotspot['mask_image'] = f"{server_base_url}/masks/{mask_filename}"
         del hotspot['_seg_class']  # strip internal key before returning

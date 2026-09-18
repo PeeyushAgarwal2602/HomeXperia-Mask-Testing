@@ -19,3 +19,4 @@ pyngrok
 qrcode 
 fpdf2
 kornia
+flasgger

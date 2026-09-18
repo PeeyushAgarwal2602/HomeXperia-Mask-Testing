@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import math
 
+from utils.cvcompat import as_points, as_segments
+
 def get_lighting_map(img, blur_k=51):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if blur_k % 2 == 0: blur_k += 1
@@ -62,7 +64,7 @@ def _detect_floor_quad(room_img):
 
     left_segs, right_segs = [], []
     if lines_full is not None:
-        for x1_, y1_, x2_, y2_ in np.asarray(lines_full).reshape(-1, 4):
+        for x1_, y1_, x2_, y2_ in as_segments(lines_full):
             y1g = y1_ + lower_y0;  y2g = y2_ + lower_y0
             dx  = float(x2_ - x1_); dy = float(y2g - y1g)
             if math.hypot(dx, dy) < max(24.0, W * 0.03): continue
@@ -115,7 +117,7 @@ def _detect_floor_quad(room_img):
     if lines_ref is not None:
         floor_top_y_init = floor_top_y
         best_score, best_y = 0.0, floor_top_y
-        for x1_, y1_, x2_, y2_ in np.asarray(lines_ref).reshape(-1, 4):
+        for x1_, y1_, x2_, y2_ in as_segments(lines_ref):
             if abs(y2_ - y1_) > 14: continue
             length = math.hypot(x2_ - x1_, y2_ - y1_)
             gy   = int((y1_ + y2_) * 0.5) + ref_lo
@@ -286,14 +288,12 @@ def apply_pattern(room_img, floor_tex, mask_img, repeat=3, rotation_deg=0, grout
         M_inv = np.linalg.inv(M)
 
         # Calculate dynamic tile scale based on Mask's physical flat width
-        coords = cv2.findNonZero(mask_gray)
+        coords = as_points(cv2.findNonZero(mask_gray))
         if coords is None:
             return room_img
             
         coords_hom = np.ones((len(coords), 3), dtype=np.float32)
-        # findNonZero's shape varies by OpenCV build — (N,1,2) locally, (N,2) in the
-        # deploy env, where coords[:, 0, :] raised "too many indices for array".
-        coords_hom[:, :2] = np.asarray(coords).reshape(-1, 2)
+        coords_hom[:, :2] = coords
         
         flat_hom_scale = (M_inv @ coords_hom.T).T
         valid_mask_scale = flat_hom_scale[:, 2] > 0.001 
