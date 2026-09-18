@@ -148,7 +148,8 @@ ALLOWED_ORIGINS = [
     "https://homexperia.com",
     "https://www.homexperia.com",
     "http://localhost:5173",
-    "http://localhost:5174"
+    "http://localhost:5174",
+    "https://drop-down-gloss-dismiss.ngrok-free.dev"
 ]
 
 CORS(app, resources={
@@ -982,7 +983,7 @@ def generate_and_segment_curtains():
         # Load the newly generated image into memory for OneFormer/SAM
         pil_image = Image.open(new_filepath).convert("RGB")
         new_room_id = str(uuid.uuid4()) # Generate a fresh ID for this new canvas state
-        server_base_url = "https://api.homexperia.com"
+        server_base_url = "https://drop-down-gloss-dismiss.ngrok-free.dev"
 
         segmentation_result = process_scene_pipeline(
             image=pil_image,
@@ -2251,7 +2252,7 @@ def analyze_scene():
         img_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         image.save(img_path)
 
-        server_base_url = "https://api.homexperia.com"
+        server_base_url = "https://drop-down-gloss-dismiss.ngrok-free.dev"
 
         print(f"{CYAN}➡ [INFO] Starting automatic scene analysis for Room: {room_id}{RESET}")
         result = process_scene_pipeline(
@@ -2334,7 +2335,7 @@ def catalogue_qr_generation():
     try:
         print(f"{CYAN}➡ [INFO] Generating {len(filter_value)} QRs for {customer_code}...{RESET}")
         
-        base_url = "https://api.homexperia.com"
+        base_url = "https://drop-down-gloss-dismiss.ngrok-free.dev"
         
         generated_data = generate_catalogue_qr(
             customer_code=customer_code,
