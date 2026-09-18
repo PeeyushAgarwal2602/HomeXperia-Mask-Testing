@@ -856,7 +856,7 @@ def process_room():
             filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
             cv2.imwrite(filepath, current_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-            final_image_url = f"https://api.homexperia.com/generated/{filename}"
+            final_image_url = f"https://drop-down-gloss-dismiss.ngrok-free.dev/generated/{filename}"
 
             with _output_cache_lock:
                 # Snapshot the stack (detached from request dicts) so hits
@@ -1195,7 +1195,7 @@ def generate_masks_only():
             #     download_name=f"mask_{room_id}.png"
             # )
             
-            mask_url = f"https://api.homexperia.com/masks/mask_{room_id}_{hotspot_id}.png"
+            mask_url = f"https://drop-down-gloss-dismiss.ngrok-free.dev/masks/mask_{room_id}_{hotspot_id}.png"
             return jsonify ({
                 "success": True,
                 "roomId": room_id,
@@ -1235,7 +1235,7 @@ def generate_pdf_report():
               example: "e5c2b534"
             roomImage:
               type: string
-              example: "https://api.homexperia.com/generated/final.jpg"
+              example: "https://drop-down-gloss-dismiss.ngrok-free.dev/generated/final.jpg"
             appliedProducts:
               type: array
               items:
@@ -1564,7 +1564,7 @@ def rug_visualizer_scene():
                 fname = f"rugdebug_{key}.jpg"
 
                 cv2.imwrite(os.path.join(app.config['GENERATED_FOLDER'], fname), overlay, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                debug_image_url = f"https://api.homexperia.com/generated/{fname}"
+                debug_image_url = f"https://drop-down-gloss-dismiss.ngrok-free.dev/generated/{fname}"
                 print(f"{GREEN}🖼  [QUAD-DEBUG] {debug_image_url}{RESET}")
 
             except Exception as dbg_err:
